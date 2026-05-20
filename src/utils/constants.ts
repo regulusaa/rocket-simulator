@@ -9,7 +9,7 @@
  * through code. Want gravity to be weaker? Change one number here.
  */
 
-import type { RocketConfig, SimulationConfig, AltitudeGoal } from "../physics/types";
+import type { RocketConfig, AltitudeGoal } from "../physics/types";
 
 /**
  * WORLD CONFIGURATION

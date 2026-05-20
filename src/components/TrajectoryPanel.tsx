@@ -14,14 +14,11 @@
 import React, { useEffect, useRef } from "react";
 import type { RocketState } from "../physics/types";
 import {
-  CANVAS_WIDTH,
-  CANVAS_HEIGHT,
   PIXELS_PER_METER,
   TRAJECTORY_PANEL_WIDTH,
   TRAJECTORY_PANEL_HEIGHT,
   COLORS,
   FONT_SIZE_SMALL,
-  FONT_SIZE_MEDIUM,
   INFO_PANEL_MARGIN,
 } from "../utils/constants";
 
@@ -63,7 +60,7 @@ export const TrajectoryPanel: React.FC<TrajectoryPanelProps> = ({
     history: Array<{ x: number; y: number }>,
     canvasW: number,
     canvasH: number,
-    scale: number
+    _scale: number
   ) => {
     // Do nothing if trajectory is empty
     if (history.length === 0) return;

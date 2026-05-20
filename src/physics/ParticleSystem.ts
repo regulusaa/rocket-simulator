@@ -110,7 +110,7 @@ export class ParticleSystem {
   public createExhaustTrail(
     rocketX: number,
     rocketY: number,
-    rocketVelocityX: number,
+    _rocketVelocityX: number,
     rocketVelocityY: number,
     thrustPercentage: number = 50
   ): void {
