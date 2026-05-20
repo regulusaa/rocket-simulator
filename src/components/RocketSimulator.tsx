@@ -1,14 +1,8 @@
 /**
- * ROCKET SIMULATOR - MAIN COMPONENT (UPDATED)
- * ============================================
- * Enhanced version with trajectory tracking and trajectory panel integration.
- * Now records the rocket's position every frame so we can visualize the flight path.
- * 
- * New features:
- * - Trajectory history tracking (all positions rocket has been at)
- * - Mini trajectory panel in bottom-left
- * - Fullscreen trajectory view with detailed metrics
- * - ESC key to close fullscreen
+ * ROCKET SIMULATOR - MAIN COMPONENT (WITH PARTICLES)
+ * ==================================================
+ * Integrates particle system for exhaust trails and visual effects.
+ * Now when rocket thrusts, particles spawn and fade creating a visible exhaust trail.
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -21,6 +15,7 @@ import {
 } from "../physics/engine";
 import type { RocketState, RocketConfig, AltitudeGoal } from "../physics/types";
 import { TrajectoryPanel } from "./TrajectoryPanel";
+import { ParticleSystem } from "../physics/ParticleSystem";
 import {
   GRAVITY,
   DRAG_COEFFICIENT,
@@ -49,7 +44,7 @@ import {
 } from "../utils/constants";
 
 /**
- * Main RocketSimulator component
+ * Main RocketSimulator component with particle effects
  */
 export const RocketSimulator: React.FC = () => {
   // === REFS (persistent across renders) ===
@@ -58,15 +53,16 @@ export const RocketSimulator: React.FC = () => {
   const animationFrameRef = useRef<number | null>(null);
   const keysPressed = useRef<{ [key: string]: boolean }>({});
 
+  // NEW: Particle system reference
+  const particleSystemRef = useRef<ParticleSystem>(new ParticleSystem());
+
   // === STATE (triggers re-renders) ===
 
-  // Rocket state and configuration
   const [rocketState, setRocketState] = useState<RocketState>(() =>
     createRocket(ROCKET_SMALL)
   );
   const [rocketConfig, setRocketConfig] = useState<RocketConfig>(ROCKET_SMALL);
 
-  // Goals
   const [selectedGoal, setSelectedGoal] = useState<AltitudeGoal | null>(
     ALTITUDE_GOALS[0]
   );
@@ -74,23 +70,22 @@ export const RocketSimulator: React.FC = () => {
     null
   );
 
-  // Landing and trajectory
   const [landingScore, setLandingScore] = useState<number | null>(null);
   const [showFullscreenTrajectory, setShowFullscreenTrajectory] =
     useState(false);
 
-  // NEW: Trajectory history - records every position the rocket has been at
-  // This is used to draw the flight path visualization
   const [trajectoryHistory, setTrajectoryHistory] = useState<
     Array<{ x: number; y: number }>
   >([]);
+
+  // NEW: Particle count for debug display
+  const [particleCount, setParticleCount] = useState(0);
 
   // === EVENT HANDLERS ===
 
   const handleKeyDown = (e: KeyboardEvent) => {
     keysPressed.current[e.key.toLowerCase()] = true;
 
-    // NEW: ESC key closes fullscreen trajectory
     if (e.key === "Escape") {
       setShowFullscreenTrajectory(false);
     }
@@ -117,8 +112,9 @@ export const RocketSimulator: React.FC = () => {
       setRocketState(newState);
       setRocketConfig(rocket);
       setLandingScore(null);
-      // Reset trajectory when changing rockets
       setTrajectoryHistory([]);
+      // Clear particles when switching rockets
+      particleSystemRef.current.clear();
     }
   };
 
@@ -150,8 +146,9 @@ export const RocketSimulator: React.FC = () => {
     setRocketState({ ...rocketState });
     setLandingScore(null);
     setShowFullscreenTrajectory(false);
-    // Reset trajectory history
     setTrajectoryHistory([]);
+    // Clear all particles on reset
+    particleSystemRef.current.clear();
   };
 
   // === DRAWING FUNCTIONS ===
@@ -192,7 +189,7 @@ export const RocketSimulator: React.FC = () => {
     ctx.closePath();
     ctx.fill();
 
-    // Flame (if thrusting)
+    // Flame
     if (state.isThrusting && state.fuelMass > 0) {
       const flameHeight =
         ROCKET_FLAME_HEIGHT_MIN +
@@ -327,8 +324,53 @@ export const RocketSimulator: React.FC = () => {
         timeStep: PHYSICS_TICK_RATE,
       }, deltaTime);
 
-      // NEW: Record current position to trajectory history
-      // Add the rocket's current position to our history
+      // === PARTICLE SYSTEM UPDATE ===
+      // Create exhaust trail particles if thrusting
+      if (physicsFrame.state.isThrusting && physicsFrame.state.fuelMass > 0) {
+        particleSystemRef.current.createExhaustTrail(
+          physicsFrame.state.position.x,
+          physicsFrame.state.position.y,
+          physicsFrame.state.velocity.x,
+          physicsFrame.state.velocity.y,
+          physicsFrame.state.thrustPercentage
+        );
+      }
+
+      // Update all particles (move, age, remove dead ones)
+      particleSystemRef.current.update(deltaTime);
+
+      // Update particle count for debug display
+      setParticleCount(particleSystemRef.current.getParticleCount());
+
+      // === LANDING EFFECTS ===
+      // Create burst particles when rocket lands
+      if (physicsFrame.groundImpact && !landingScore) {
+        const score = calculateLandingScore(physicsFrame.state.landingVelocity);
+        setLandingScore(score);
+
+        // Create burst effect based on landing quality
+        if (score > 50) {
+          // Soft landing = small puff
+          particleSystemRef.current.createBurst(
+            physicsFrame.state.position.x,
+            0,
+            5,
+            "rgba(200, 200, 200, 1)",
+            10
+          );
+        } else {
+          // Hard landing = big explosion
+          particleSystemRef.current.createBurst(
+            physicsFrame.state.position.x,
+            0,
+            15,
+            "rgba(255, 100, 0, 1)",
+            30
+          );
+        }
+      }
+
+      // Record trajectory
       setTrajectoryHistory((prev) => [
         ...prev,
         {
@@ -337,16 +379,19 @@ export const RocketSimulator: React.FC = () => {
         },
       ]);
 
-      if (physicsFrame.groundImpact && !landingScore) {
-        const score = calculateLandingScore(physicsFrame.state.landingVelocity);
-        setLandingScore(score);
-      }
-
       setRocketState({ ...physicsFrame.state });
 
       // === RENDER ===
       ctx.fillStyle = COLORS.background;
       ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+      // Draw particles BEFORE rocket so rocket is on top
+      particleSystemRef.current.draw(
+        ctx,
+        PIXELS_PER_METER,
+        CANVAS_WIDTH,
+        CANVAS_HEIGHT
+      );
 
       drawGround(ctx);
       drawRocket(ctx, physicsFrame.state);
@@ -416,7 +461,6 @@ export const RocketSimulator: React.FC = () => {
         color: COLORS.text,
       }}
     >
-      {/* Show fullscreen trajectory if enabled */}
       {showFullscreenTrajectory && (
         <TrajectoryPanel
           rocketState={rocketState}
@@ -426,7 +470,6 @@ export const RocketSimulator: React.FC = () => {
         />
       )}
 
-      {/* Main UI (hidden when fullscreen) */}
       {!showFullscreenTrajectory && (
         <>
           <h1 style={{ marginBottom: "20px" }}>🚀 Rocket Simulator</h1>
@@ -445,7 +488,6 @@ export const RocketSimulator: React.FC = () => {
               }}
             />
 
-            {/* Mini trajectory panel (bottom-left) */}
             <div style={{ position: "absolute", bottom: "20px", left: "20px" }}>
               <TrajectoryPanel
                 rocketState={rocketState}
@@ -453,7 +495,6 @@ export const RocketSimulator: React.FC = () => {
                 isFullscreen={false}
                 onCloseFullscreen={() => {}}
               />
-              {/* Button to expand trajectory to fullscreen */}
               <button
                 onClick={() => setShowFullscreenTrajectory(true)}
                 style={{
@@ -583,6 +624,7 @@ export const RocketSimulator: React.FC = () => {
             <div style={{ fontSize: "12px", color: "rgba(255,255,255,0.5)" }}>
               <p>State: {rocketState.isFlying ? "Flying" : rocketState.hasLanded ? "Landed" : "Ready"}</p>
               <p>Trajectory points: {trajectoryHistory.length}</p>
+              <p>Particles: {particleCount}</p>
             </div>
           )}
         </>
