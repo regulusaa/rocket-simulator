@@ -1,20 +1,14 @@
 /**
- * ROCKET SIMULATOR - MAIN COMPONENT (PERFORMANCE-OPTIMIZED VERSION)
- * ==================================================================
- * Final integrated version with performance monitoring, optimization,
- * and trajectory management. Combines all previous features with real-time
- * performance tracking and automatic optimization.
+ * ROCKET SIMULATOR - FINAL COMPLETE VERSION (WITH AUDIO)
+ * =======================================================
+ * Complete integrated rocket simulator with all features:
+ * - Multi-stage rocket physics and staging
+ * - Advanced landing mechanics with parachutes
+ * - Particle effects and trajectory visualization
+ * - Real-time performance monitoring and optimization
+ * - Complete audio system with sound effects
  * 
- * Features:
- * - Multi-stage rocket flight simulation with automatic staging
- * - Advanced landing mechanics with parachutes and damage calculation
- * - Particle system with exhaust trails and visual effects
- * - Trajectory visualization with fullscreen analysis view
- * - Real-time FPS and performance monitoring
- * - Automatic trajectory cleanup and optimization
- * - Performance warnings and health scoring
- * - Landing gear and parachute deployment
- * - Comprehensive telemetry display
+ * All systems fully integrated and optimized.
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -35,7 +29,6 @@ import {
   deployParachute,
   updateParachute,
   processLanding,
-  resetLanding,
   type Parachute,
   type LandingGear,
   type LandingState,
@@ -46,6 +39,7 @@ import {
   getPerformanceStatus,
   type PerformanceMetrics,
 } from "../utils/PerformanceMonitor";
+import { AudioManager, type SoundEffect } from "../utils/AudioSystem";
 import {
   GRAVITY,
   DRAG_COEFFICIENT,
@@ -77,134 +71,143 @@ import {
 import type { AltitudeGoal } from "../physics/types";
 
 /**
- * Performance-optimized multi-stage RocketSimulator component
- * Integrated version with all features and performance monitoring
+ * Complete final RocketSimulator component with audio integration
  */
 export const RocketSimulator: React.FC = () => {
   // === REFS (persistent across renders) ===
 
-  // Reference to the canvas element where everything is drawn
+  // Canvas reference
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Reference to animation frame ID (used for cleanup on unmount)
+  // Animation frame ID
   const animationFrameRef = useRef<number | null>(null);
 
-  // Track which keys are pressed (for smooth continuous input handling)
+  // Input tracking
   const keysPressed = useRef<{ [key: string]: boolean }>({});
 
-  // Particle system for visual effects like exhaust trails and explosions
+  // Particle system
   const particleSystemRef = useRef<ParticleSystem>(new ParticleSystem());
 
-  // === NEW: PERFORMANCE MONITORING ===
-
-  // Performance monitor for tracking FPS, frame times, and metrics
-  // Monitors health of the simulator and generates performance warnings
+  // Performance monitoring
   const performanceMonitorRef = useRef<PerformanceMonitor>(
     new PerformanceMonitor()
   );
 
-  // Trajectory limiter for automatic cleanup and optimization
-  // Prevents trajectory history from growing too large and consuming memory
+  // Trajectory optimization
   const trajectoryLimiterRef = useRef(
     new TrajectoryLimiter({
-      maxPoints: 50000, // Keep maximum 50k trajectory points
-      sampleRate: 1, // Keep every point (1), increase to 2+ for aggressive sampling
-      cleanupInterval: 5, // Cleanup every 5 seconds
+      maxPoints: 50000,
+      sampleRate: 1,
+      cleanupInterval: 5,
     })
   );
 
-  // === STATE (triggers re-renders when changed) ===
+  // === NEW: AUDIO SYSTEM ===
 
-  // Flight state: position, velocity, acceleration, metrics
+  // Audio manager for all sound effects
+  const audioManagerRef = useRef<AudioManager>(new AudioManager());
+
+  // Track previous throttle state for throttle up/down sounds
+  const previousThrottleRef = useRef<number>(0);
+
+  // Track if engine is currently playing
+  const engineSoundPlayingRef = useRef<boolean>(false);
+
+  // === STATE ===
+
+  // Flight state
   const [flightState, setFlightState] = useState<MultiStageRocketState>(() =>
     createMultiStageRocket(ROCKET_SIMPLE_TWO_STAGE)
   );
 
-  // Rocket configuration: all stages and their specifications
+  // Rocket configuration
   const [rocketConfig, setRocketConfig] = useState<MultiStageRocketConfig>(
     ROCKET_SIMPLE_TWO_STAGE
   );
 
-  // Currently selected altitude goal (what the player is trying to reach)
+  // Selected goal
   const [selectedGoal, setSelectedGoal] = useState<AltitudeGoal | null>(
     ALTITUDE_GOALS[0]
   );
 
-  // Custom altitude goal entered by user (if they want a custom target)
+  // Custom goal
   const [customGoalAltitude, setCustomGoalAltitude] = useState<number | null>(
     null
   );
 
-  // Landing score (0-100) calculated after rocket lands
+  // Landing score
   const [landingScore, setLandingScore] = useState<number | null>(null);
 
-  // Should fullscreen trajectory view be shown?
+  // Fullscreen trajectory
   const [showFullscreenTrajectory, setShowFullscreenTrajectory] =
     useState(false);
 
-  // Trajectory history: array of all positions rocket has been at
-  // This is optimized and limited by the trajectory limiter
+  // Trajectory history
   const [trajectoryHistory, setTrajectoryHistory] = useState<
     Array<{ x: number; y: number }>
   >([]);
 
-  // Particle count for debug display
+  // Particle count
   const [particleCount, setParticleCount] = useState(0);
 
-  // === LANDING MECHANICS STATE ===
-
-  // Landing state: tracks damage, parachutes deployed, reusability, etc.
+  // Landing mechanics
   const [landingState, setLandingState] = useState<LandingState>(
     createLandingState()
   );
 
-  // Parachute system for the final stage
   const [finalStageParachute, setFinalStageParachute] = useState<Parachute>(
     createParachute(100000, 1)
   );
 
-  // Landing gear for shock absorption during impact
   const [landingGear, setLandingGear] = useState<LandingGear>(
     createLandingGear(500000)
   );
 
-  // Track if parachute deployment has been triggered
   const parachuteDeployedRef = useRef(false);
 
-  // === NEW: PERFORMANCE METRICS STATE ===
-
-  // Current performance metrics (FPS, frame time, warnings, health score)
-  // Updated every frame from the performance monitor
+  // Performance metrics
   const [performanceMetrics, setPerformanceMetrics] = useState<PerformanceMetrics>(
     performanceMonitorRef.current.getMetrics()
   );
 
-  // Should performance stats be shown in UI?
-  // Can be toggled via DEBUG_MODE or user preference
   const [showPerformanceStats, setShowPerformanceStats] = useState(DEBUG_MODE);
+
+  // === NEW: AUDIO STATE ===
+
+  // Is audio muted?
+  const [audioMuted, setAudioMuted] = useState(false);
+
+  // Master volume (0-1)
+  const [masterVolume, setMasterVolume] = useState(0.5);
 
   // === EVENT HANDLERS ===
 
   /**
-   * Handle key press down (for thrust control and other inputs)
-   * Records which key was pressed so we can check it every frame
+   * Handle key press
    */
   const handleKeyDown = (e: KeyboardEvent) => {
     keysPressed.current[e.key.toLowerCase()] = true;
 
-    // ESC key closes fullscreen trajectory view
+    // ESC closes fullscreen
     if (e.key === "Escape") {
       setShowFullscreenTrajectory(false);
     }
 
-    // Spacebar doesn't scroll the page
+    // Spacebar doesn't scroll
     if (e.key === " ") {
       e.preventDefault();
     }
 
-    // Toggle performance stats with 'P' key (for debugging)
+    // P toggles performance stats
     if (e.key === "p" || e.key === "P") {
       setShowPerformanceStats((prev) => !prev);
+    }
+
+    // M toggles audio mute
+    if (e.key === "m" || e.key === "M") {
+      const newMuted = audioManagerRef.current.toggleMute();
+      setAudioMuted(newMuted);
+      audioManagerRef.current.playSound("ui-click");
     }
   };
 
@@ -216,14 +219,14 @@ export const RocketSimulator: React.FC = () => {
   };
 
   /**
-   * Handle canvas click for burst thrust
+   * Handle canvas click
    */
   const handleCanvasClick = () => {
     keysPressed.current["mouseClick"] = true;
   };
 
   /**
-   * Handle rocket model selection
+   * Handle rocket selection with sound effect
    */
   const handleRocketChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const selectedName = e.target.value;
@@ -250,15 +253,17 @@ export const RocketSimulator: React.FC = () => {
       setLandingGear(createLandingGear(500000));
       parachuteDeployedRef.current = false;
 
-      // Reset performance monitor for new flight
       performanceMonitorRef.current.reset();
 
       particleSystemRef.current.clear();
+
+      // Play UI sound
+      audioManagerRef.current.playSound("ui-select");
     }
   };
 
   /**
-   * Handle altitude goal selection
+   * Handle goal selection with sound
    */
   const handleGoalChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const goalName = e.target.value;
@@ -267,11 +272,12 @@ export const RocketSimulator: React.FC = () => {
     if (goal) {
       setSelectedGoal(goal);
       setCustomGoalAltitude(null);
+      audioManagerRef.current.playSound("ui-select");
     }
   };
 
   /**
-   * Handle custom altitude goal input
+   * Handle custom goal input
    */
   const handleCustomGoal = (e: React.ChangeEvent<HTMLInputElement>) => {
     const value = e.target.value;
@@ -289,7 +295,7 @@ export const RocketSimulator: React.FC = () => {
   };
 
   /**
-   * Handle reset button (launches new flight)
+   * Handle reset button with sound
    */
   const handleReset = () => {
     resetRocket(flightState, rocketConfig);
@@ -303,10 +309,24 @@ export const RocketSimulator: React.FC = () => {
     setLandingGear(createLandingGear(500000));
     parachuteDeployedRef.current = false;
 
-    // Reset performance monitor
     performanceMonitorRef.current.reset();
 
     particleSystemRef.current.clear();
+
+    // Stop all audio and play click sound
+    audioManagerRef.current.stopAllSounds();
+    audioManagerRef.current.playSound("ui-click");
+
+    engineSoundPlayingRef.current = false;
+  };
+
+  /**
+   * Handle volume change
+   */
+  const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const volume = parseFloat(e.target.value);
+    setMasterVolume(volume);
+    audioManagerRef.current.setMasterVolume(volume);
   };
 
   // === DRAWING FUNCTIONS ===
@@ -329,24 +349,23 @@ export const RocketSimulator: React.FC = () => {
   };
 
   /**
-   * Draw the rocket and all its stages, flame, parachute, and landing gear
+   * Draw the rocket
    */
   const drawRocket = (ctx: CanvasRenderingContext2D, state: MultiStageRocketState) => {
     const screenX = (CANVAS_WIDTH / 2) + (state.position.x * PIXELS_PER_METER);
     const screenY = CANVAS_HEIGHT - 20 - (state.position.y * PIXELS_PER_METER);
 
-    // === DRAW EACH STAGE ===
     let currentScreenY = screenY;
 
+    // Draw each stage
     for (let i = 0; i < rocketConfig.stages.length; i++) {
       const stage = rocketConfig.stages[i];
 
       if (stage.isSeparated) continue;
 
-      // Color each stage differently for visual distinction
       const stageColor = `rgba(${200 - i * 40}, ${200 - i * 40}, ${200 - i * 40}, 1)`;
-
       const stageHeight = 30 + i * 5;
+
       ctx.fillStyle = stageColor;
       ctx.fillRect(
         screenX - ROCKET_BODY_WIDTH / 2,
@@ -355,7 +374,6 @@ export const RocketSimulator: React.FC = () => {
         stageHeight
       );
 
-      // Draw stage border
       ctx.strokeStyle = COLORS.text;
       ctx.lineWidth = 1;
       ctx.strokeRect(
@@ -365,7 +383,7 @@ export const RocketSimulator: React.FC = () => {
         stageHeight
       );
 
-      // === DRAW FUEL LEVEL BAR ===
+      // Fuel bar
       const fuelPercent = (stage.fuelMass / stage.fuelCapacity) * 100;
       const fuelBarWidth = (ROCKET_BODY_WIDTH - 4) * (fuelPercent / 100);
       const fuelColor = fuelPercent > 20 ? "#00ff00" : "#ff4444";
@@ -381,7 +399,7 @@ export const RocketSimulator: React.FC = () => {
       currentScreenY -= stageHeight;
     }
 
-    // === DRAW NOSE CONE ===
+    // Nose cone
     ctx.fillStyle = COLORS.rocketNose;
     ctx.beginPath();
     ctx.moveTo(screenX, currentScreenY - ROCKET_NOSE_HEIGHT);
@@ -390,7 +408,7 @@ export const RocketSimulator: React.FC = () => {
     ctx.closePath();
     ctx.fill();
 
-    // === DRAW THRUST FLAME ===
+    // Flame
     const activeStage = rocketConfig.stages.find((s) => s.isActive && !s.isSeparated);
     if (activeStage && activeStage.isThrusting && activeStage.fuelMass > 0) {
       const flameHeight =
@@ -417,7 +435,7 @@ export const RocketSimulator: React.FC = () => {
       ctx.fill();
     }
 
-    // === DRAW PARACHUTE ===
+    // Parachute
     if (finalStageParachute.isDeployed && finalStageParachute.deploymentProgress > 0) {
       const parachuteRadius = 20 * finalStageParachute.deploymentProgress;
       const parachuteY = currentScreenY - 40 - parachuteRadius;
@@ -445,7 +463,7 @@ export const RocketSimulator: React.FC = () => {
       }
     }
 
-    // === DRAW LANDING GEAR ===
+    // Landing gear
     if (flightState.position.y <= 1) {
       let gearColor = "#00ff00";
       if (landingGear.damageState > 0.5) {
@@ -471,7 +489,7 @@ export const RocketSimulator: React.FC = () => {
   };
 
   /**
-   * Draw the telemetry panel with flight data
+   * Draw telemetry panel
    */
   const drawInfoPanel = (ctx: CanvasRenderingContext2D, state: MultiStageRocketState) => {
     const panelX = CANVAS_WIDTH - INFO_PANEL_WIDTH - INFO_PANEL_MARGIN;
@@ -560,8 +578,7 @@ export const RocketSimulator: React.FC = () => {
   };
 
   /**
-   * Draw performance stats in top-left corner (if enabled)
-   * Shows FPS, frame time, particle count, etc.
+   * Draw performance stats
    */
   const drawPerformanceStats = (ctx: CanvasRenderingContext2D, metrics: PerformanceMetrics) => {
     const panelX = 10;
@@ -569,11 +586,9 @@ export const RocketSimulator: React.FC = () => {
     const panelWidth = 280;
     const panelHeight = 200;
 
-    // Semi-transparent background
     ctx.fillStyle = "rgba(0, 0, 0, 0.8)";
     ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
 
-    // Border
     const perfStatus = getPerformanceStatus(metrics);
     ctx.strokeStyle = perfStatus.color;
     ctx.lineWidth = 2;
@@ -632,8 +647,7 @@ export const RocketSimulator: React.FC = () => {
   // === GAME LOOP ===
 
   /**
-   * Main game loop: runs every frame (~60 FPS)
-   * Handles physics, rendering, particles, and performance monitoring
+   * Main game loop with audio integration
    */
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -645,15 +659,14 @@ export const RocketSimulator: React.FC = () => {
     let lastFrameTime = Date.now();
 
     const gameLoop = () => {
-      // === START FRAME TIMING ===
+      // Start timing
       performanceMonitorRef.current.startFrame();
 
-      // === CALCULATE DELTA TIME ===
       const now = Date.now();
       const deltaTime = Math.min((now - lastFrameTime) / 1000, 0.1);
       lastFrameTime = now;
 
-      // === APPLY PLAYER CONTROLS ===
+      // === APPLY CONTROLS ===
       const isSpacebarPressed = keysPressed.current[" "];
       const isClickActive = keysPressed.current["mouseClick"] || false;
 
@@ -673,6 +686,44 @@ export const RocketSimulator: React.FC = () => {
 
       performanceMonitorRef.current.endPhysicsTimer();
 
+      // === AUDIO: ENGINE SOUND ===
+      // Play/update engine thrust sound based on throttle
+      const activeStage = rocketConfig.stages.find((s) => s.isActive && !s.isSeparated);
+      const currentThrottle = activeStage ? activeStage.thrustPercentage : 0;
+
+      // Throttle up sound
+      if (currentThrottle > previousThrottleRef.current && currentThrottle > 0 && previousThrottleRef.current === 0) {
+        audioManagerRef.current.playSound("engine-ignition");
+      }
+
+      // Throttle increase sound
+      if (currentThrottle > previousThrottleRef.current + 10) {
+        audioManagerRef.current.playSound("thrust-increase");
+      }
+
+      // Throttle decrease sound
+      if (currentThrottle < previousThrottleRef.current - 10) {
+        audioManagerRef.current.playSound("thrust-decrease");
+      }
+
+      // Continuous engine sound
+      if (currentThrottle > 0 && flightState.isFlying) {
+        if (!engineSoundPlayingRef.current) {
+          audioManagerRef.current.playSound("engine-thrust", {
+            loop: true,
+            pitch: 0.8 + (currentThrottle / 100) * 0.4, // Pitch varies with throttle
+          });
+          engineSoundPlayingRef.current = true;
+        }
+      } else {
+        if (engineSoundPlayingRef.current) {
+          audioManagerRef.current.stopSound("engine-thrust");
+          engineSoundPlayingRef.current = false;
+        }
+      }
+
+      previousThrottleRef.current = currentThrottle;
+
       // === PARACHUTE DEPLOYMENT ===
       if (
         flightState.isFlying &&
@@ -682,9 +733,9 @@ export const RocketSimulator: React.FC = () => {
       ) {
         deployParachute(finalStageParachute);
         parachuteDeployedRef.current = true;
+        audioManagerRef.current.playSound("parachute-deploy");
       }
 
-      // === UPDATE PARACHUTE ===
       const parachtuteDragForce = updateParachute(finalStageParachute, deltaTime);
 
       if (parachtuteDragForce > 0) {
@@ -693,7 +744,7 @@ export const RocketSimulator: React.FC = () => {
         physicsFrame.state.acceleration.y += parachtuteDragAcceleration;
       }
 
-      // === STAGE SEPARATION EFFECTS ===
+      // === STAGE SEPARATION ===
       if (physicsFrame.state.didStageSeperateThisFrame) {
         particleSystemRef.current.createBurst(
           physicsFrame.state.position.x,
@@ -702,12 +753,10 @@ export const RocketSimulator: React.FC = () => {
           "rgba(255, 200, 100, 1)",
           40
         );
+        audioManagerRef.current.playSound("stage-separation");
       }
 
       // === EXHAUST TRAIL ===
-      const activeStage = rocketConfig.stages.find(
-        (s) => s.isActive && !s.isSeparated
-      );
       if (activeStage && activeStage.isThrusting && activeStage.fuelMass > 0) {
         particleSystemRef.current.createExhaustTrail(
           physicsFrame.state.position.x,
@@ -718,11 +767,10 @@ export const RocketSimulator: React.FC = () => {
         );
       }
 
-      // === UPDATE PARTICLES ===
       particleSystemRef.current.update(deltaTime);
       setParticleCount(particleSystemRef.current.getParticleCount());
 
-      // === LANDING IMPACT PROCESSING ===
+      // === LANDING ===
       if (physicsFrame.groundImpact && !landingState.hasTouchedDown) {
         const updatedLandingState = processLanding(
           landingState,
@@ -737,6 +785,7 @@ export const RocketSimulator: React.FC = () => {
         const score = calculateLandingScore(physicsFrame.state.landingVelocity);
         setLandingScore(score);
 
+        // Play landing sound based on impact
         if (score > 50) {
           particleSystemRef.current.createBurst(
             physicsFrame.state.position.x,
@@ -745,6 +794,7 @@ export const RocketSimulator: React.FC = () => {
             "rgba(200, 200, 200, 1)",
             10
           );
+          audioManagerRef.current.playSound("landing-soft");
         } else {
           particleSystemRef.current.createBurst(
             physicsFrame.state.position.x,
@@ -753,29 +803,29 @@ export const RocketSimulator: React.FC = () => {
             "rgba(255, 100, 0, 1)",
             30
           );
+          audioManagerRef.current.playSound("landing-hard");
         }
+
+        audioManagerRef.current.stopSound("engine-thrust");
+        engineSoundPlayingRef.current = false;
       }
 
-      // === RECORD TRAJECTORY ===
+      // === TRAJECTORY ===
       const newPoint = { x: physicsFrame.state.position.x, y: physicsFrame.state.position.y };
-      
+
       setTrajectoryHistory((prev) => {
         const updated = [...prev, newPoint];
-        // Limit trajectory size automatically
         return trajectoryLimiterRef.current.limitTrajectory(updated);
       });
 
-      // === UPDATE STATE ===
       setFlightState({ ...physicsFrame.state });
 
       // === RENDERING ===
       performanceMonitorRef.current.startRenderTimer();
 
-      // Clear canvas
       ctx.fillStyle = COLORS.background;
       ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-      // Draw particles
       particleSystemRef.current.draw(
         ctx,
         PIXELS_PER_METER,
@@ -783,12 +833,11 @@ export const RocketSimulator: React.FC = () => {
         CANVAS_HEIGHT
       );
 
-      // Draw world
       drawGround(ctx);
       drawRocket(ctx, flightState);
       drawInfoPanel(ctx, flightState);
 
-      // === DRAW GOAL INDICATOR ===
+      // Goal indicator
       if (selectedGoal || customGoalAltitude) {
         const goalAlt = customGoalAltitude || selectedGoal?.altitude || 0;
         const goalScreenY = CANVAS_HEIGHT - 20 - (goalAlt * PIXELS_PER_METER);
@@ -815,15 +864,12 @@ export const RocketSimulator: React.FC = () => {
 
       performanceMonitorRef.current.endRenderTimer();
 
-      // === UPDATE PERFORMANCE METRICS ===
       performanceMonitorRef.current.setParticleCount(particleSystemRef.current.getParticleCount());
       performanceMonitorRef.current.setTrajectoryPointCount(trajectoryHistory.length);
       performanceMonitorRef.current.endFrame();
 
-      // Update performance metrics state
       setPerformanceMetrics(performanceMonitorRef.current.getMetrics());
 
-      // === DRAW PERFORMANCE STATS (if enabled) ===
       if (showPerformanceStats) {
         drawPerformanceStats(ctx, performanceMonitorRef.current.getMetrics());
       }
@@ -852,7 +898,7 @@ export const RocketSimulator: React.FC = () => {
     };
   }, []);
 
-  // === RENDER UI ===
+  // === RENDER ===
 
   return (
     <div
@@ -923,7 +969,7 @@ export const RocketSimulator: React.FC = () => {
           </div>
 
           <div style={{ marginBottom: "15px", textAlign: "center" }}>
-            <p>SPACEBAR: Hold for continuous thrust | CLICK: Burst thrust | P: Performance stats | ESC: Close fullscreen</p>
+            <p>SPACEBAR: Hold for thrust | CLICK: Burst | P: Perf | M: Mute | ESC: Close fullscreen</p>
           </div>
 
           <div
@@ -933,6 +979,7 @@ export const RocketSimulator: React.FC = () => {
               marginBottom: "20px",
               flexWrap: "wrap",
               justifyContent: "center",
+              alignItems: "center",
             }}
           >
             <div>
@@ -1004,6 +1051,39 @@ export const RocketSimulator: React.FC = () => {
             >
               Reset
             </button>
+
+            {/* === NEW: AUDIO CONTROLS === */}
+            <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+              <button
+                onClick={() => {
+                  const newMuted = audioManagerRef.current.toggleMute();
+                  setAudioMuted(newMuted);
+                }}
+                style={{
+                  padding: "8px 12px",
+                  backgroundColor: audioMuted ? "#ff4444" : COLORS.ui,
+                  color: COLORS.text,
+                  border: `1px solid ${COLORS.text}`,
+                  cursor: "pointer",
+                  fontSize: "14px",
+                }}
+                title="Toggle mute (M key)"
+              >
+                {audioMuted ? "🔇 MUTED" : "🔊 AUDIO"}
+              </button>
+
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.1"
+                value={masterVolume}
+                onChange={handleVolumeChange}
+                style={{ width: "100px", cursor: "pointer" }}
+                title="Master volume"
+              />
+              <span style={{ fontSize: "12px" }}>{Math.round(masterVolume * 100)}%</span>
+            </div>
           </div>
 
           {landingScore !== null && (
