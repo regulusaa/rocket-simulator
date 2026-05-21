@@ -6,13 +6,15 @@
  * over React state — the game loop can call them without stale-value concerns.
  *
  * Functions defined here:
- *   drawBackground   — sky gradient that darkens with altitude
- *   drawStars        — 300-star parallax field
- *   drawGround       — green surface line at world Y=0
- *   drawGoalLine     — dashed altitude target line
- *   drawRocket       — detailed tapered body, fins, porthole, flame, glow
- *   drawTelemetry    — HUD overlay panel (bottom-right)
- *   drawPerfStats    — performance overlay (top-left, debug only)
+ *   drawBackground         — sky gradient that darkens with altitude
+ *   drawStars              — 300-star parallax field
+ *   drawGround             — green surface line at world Y=0
+ *   drawGoalLine           — dashed altitude target line
+ *   drawRocket             — detailed tapered body, fins, porthole, flame, glow
+ *   drawTelemetry          — HUD overlay panel (bottom-right)
+ *   drawPerfStats          — performance overlay (top-left, debug only)
+ *   drawAltitudeMarkers    — altitude ribbon with named thresholds on right edge
+ *   drawLandingTarget      — concentric precision-landing rings at x=0, y=0
  */
 
 import type { Camera } from "./Camera";
@@ -1255,4 +1257,245 @@ export function drawStructuralFailureOverlay(
   // ── RESTORE CONTEXT ───────────────────────────────────────────────────────
   ctx.textAlign = "left"; // Reset to default
   ctx.textBaseline = "alphabetic"; // Reset to default
+}
+
+// ─── ALTITUDE MARKERS ─────────────────────────────────────────────────────────
+
+/**
+ * Draw altitude tick marks and labels on the right edge of the canvas.
+ *
+ * PURPOSE:
+ *   The main canvas uses world-space coordinates rendered through the camera, which
+ *   means the player can't easily tell how high the rocket is just by looking at
+ *   the screen. Altitude markers provide a fixed, easy-to-read scale bar on the
+ *   right side — like the altitude tape on a real aircraft's primary flight display.
+ *
+ * ADAPTIVE SPACING:
+ *   We pick a tick interval that gives roughly 6-10 ticks on screen regardless of zoom.
+ *   Strategy: find the order of magnitude of the visible altitude range, then
+ *   round up to 1, 2, or 5 × that magnitude (the "nice number" technique).
+ *
+ *   Example: visible range = 8,000 m.
+ *     rawInterval = 8000 / 8 = 1000 m.
+ *     magnitude = 10^floor(log10(1000)) = 1000.
+ *     normalized = 1000/1000 = 1.0 → pick 1 (already a nice number) → interval = 1000 m.
+ *   Labels show "1.0 km", "2.0 km", etc.
+ *
+ * SPECIAL ALTITUDE MARKERS:
+ *   Named thresholds (Kármán Line at 100 km, etc.) get a distinct color and label.
+ *   These help learners build intuition for what these altitudes mean.
+ *
+ * @param ctx          Canvas 2D context.
+ * @param canvasWidth  Canvas width in pixels.
+ * @param canvasHeight Canvas height in pixels.
+ * @param camera       Active camera (provides world→screen transform and current zoom).
+ */
+export function drawAltitudeMarkers(
+  ctx: CanvasRenderingContext2D,
+  canvasWidth: number,
+  canvasHeight: number,
+  camera: Camera
+): void {
+  // How many world meters are visible vertically at current zoom level.
+  // At zoom=1 (1px/m), canvasHeight meters are visible.
+  // At zoom=0.001 (0.001px/m), canvasHeight/0.001 = 1000×canvasHeight meters visible.
+  const visibleWorldH = canvasHeight / camera.zoom; // meters
+
+  // Adaptive tick spacing: aim for ~8 ticks, rounded to a "nice" number.
+  const rawInterval = visibleWorldH / 8;
+  if (rawInterval <= 0) return; // Safety: don't draw if zoom is absurd
+
+  const magnitude = Math.pow(10, Math.floor(Math.log10(rawInterval)));
+  const normalized = rawInterval / magnitude;
+  // Round up to 1, 2, or 5 (the standard "nice number" rounding)
+  const tickInterval = magnitude * (normalized < 1.5 ? 1 : normalized < 3.5 ? 2 : normalized < 7 ? 5 : 10);
+
+  // Find the lowest and highest world altitudes visible on screen.
+  // worldToScreen inverse: worldY = (screenY - ch/2 - camera.shake.y) / camera.zoom + camera.y
+  // We approximate using the camera's world position and zoom.
+  const topWorldY    = camera.y + (canvasHeight / 2) / camera.zoom;    // Top of screen in world m
+  const bottomWorldY = camera.y - (canvasHeight / 2) / camera.zoom;    // Bottom of screen in world m
+
+  // Start at the first tick above the bottom visible altitude
+  const firstTick = Math.ceil(bottomWorldY / tickInterval) * tickInterval;
+
+  // Panel dimensions on the right side
+  const panelW = 62; // Width of the altitude ribbon panel
+  const panelX = canvasWidth - panelW; // Left edge of the panel
+
+  // Translucent panel background — dark strip on the right edge
+  ctx.fillStyle = "rgba(5, 10, 28, 0.55)";
+  ctx.fillRect(panelX, 0, panelW, canvasHeight);
+
+  // Left border line of the panel
+  ctx.strokeStyle = "rgba(74, 111, 165, 0.4)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(panelX, 0);
+  ctx.lineTo(panelX, canvasHeight);
+  ctx.stroke();
+
+  // Named thresholds: highlight these with distinct colors and labels
+  const namedAltitudes: Array<{ altitude: number; label: string; color: string }> = [
+    { altitude: 0,       label: "GROUND",      color: "#4a8020" },
+    { altitude: 10000,   label: "10km",        color: "#4488aa" },
+    { altitude: 18000,   label: "18km",        color: "#4488aa" },
+    { altitude: 32000,   label: "32km",        color: "#2266aa" },
+    { altitude: 50000,   label: "50km",        color: "#aa6600" },
+    { altitude: 80000,   label: "MESOPAUSE",   color: "#885500" },
+    { altitude: 100000,  label: "KÁRMÁN",      color: "#ff4400" },
+    { altitude: 200000,  label: "200km",       color: "#cc3322" },
+    { altitude: 400000,  label: "ISS ORBIT",   color: "#cc2200" },
+  ];
+
+  // Draw tick marks for all altitudes in the visible range
+  for (let alt = firstTick; alt <= topWorldY + tickInterval; alt += tickInterval) {
+    if (alt < 0) continue; // Don't draw negative altitude ticks
+
+    // Convert world altitude to screen Y position
+    const { y: screenY } = camera.worldToScreen(camera.x, alt, canvasWidth, canvasHeight);
+    if (screenY < 0 || screenY > canvasHeight) continue; // Skip off-screen ticks
+
+    // Tick line: short horizontal mark from the panel border inward
+    ctx.strokeStyle = "rgba(150, 180, 220, 0.5)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(panelX + 3, screenY);
+    ctx.lineTo(panelX + 14, screenY);
+    ctx.stroke();
+
+    // Altitude label: convert meters to km for display above ~1000m
+    ctx.fillStyle = "rgba(180, 210, 240, 0.8)";
+    ctx.font = "9px monospace";
+    ctx.textAlign = "right";
+    const label = alt >= 1000
+      ? `${(alt / 1000).toFixed(alt >= 10000 ? 0 : 1)}km`
+      : `${alt.toFixed(0)}m`;
+    ctx.fillText(label, canvasWidth - 4, screenY - 2);
+  }
+
+  // Draw named altitude threshold highlights
+  for (const named of namedAltitudes) {
+    const { y: screenY } = camera.worldToScreen(camera.x, named.altitude, canvasWidth, canvasHeight);
+    if (screenY < 0 || screenY > canvasHeight) continue;
+
+    // Horizontal accent line across the full panel width
+    ctx.strokeStyle = named.color;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(panelX, screenY);
+    ctx.lineTo(canvasWidth, screenY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Named label (above the line, smaller + colored)
+    ctx.fillStyle = named.color;
+    ctx.font = "bold 8px monospace";
+    ctx.textAlign = "right";
+    ctx.fillText(named.label, canvasWidth - 3, screenY - 3);
+  }
+
+  ctx.textAlign = "left"; // Reset text alignment
+}
+
+// ─── LANDING TARGET CIRCLES ───────────────────────────────────────────────────
+
+/**
+ * Draw concentric landing target rings centered on the launch pad (world x=0, y=0).
+ *
+ * PURPOSE:
+ *   A real rocket's landing target is a bullseye — the closer you land to the pad,
+ *   the better. SpaceX uses a drone ship with painted circles; NASA uses marked
+ *   landing zones. These rings give the player a visual precision goal and help
+ *   them appreciate how accurate (or inaccurate) their landing was.
+ *
+ * RINGS (scaled by camera zoom for readability):
+ *   10m  — innermost: "bullseye" — near-perfect precision landing
+ *   50m  — inner ring: SpaceX Falcon 9 ASDS accuracy (~10m typical, 50m limit)
+ *   200m — middle ring: Soyuz capsule land accuracy (parachute-only)
+ *   1km  — outer ring: Typical vehicle range for first-time rockets
+ *
+ * VISIBILITY:
+ *   Only drawn when the ground is visible on screen (y=0 is within canvas bounds).
+ *   Rings scale with zoom so they're readable at all zoom levels.
+ *
+ * @param ctx          Canvas 2D context.
+ * @param canvasWidth  Canvas width in pixels.
+ * @param canvasHeight Canvas height in pixels.
+ * @param camera       Active camera for world→screen transform.
+ */
+export function drawLandingTarget(
+  ctx: CanvasRenderingContext2D,
+  canvasWidth: number,
+  canvasHeight: number,
+  camera: Camera
+): void {
+  // Get screen position of the launch pad origin (world 0, 0)
+  const { x: padX, y: padY } = camera.worldToScreen(0, 0, canvasWidth, canvasHeight);
+
+  // Only draw if the launch pad is within the visible canvas (with generous margin)
+  if (padY < -200 || padY > canvasHeight + 200) return;
+
+  // Ring radii in WORLD meters and their display properties
+  const rings: Array<{ radius: number; color: string; label: string }> = [
+    { radius: 10,   color: "rgba(0, 255, 0, 0.9)",   label: "10m"  },  // Bullseye — green
+    { radius: 50,   color: "rgba(0, 200, 100, 0.6)", label: "50m"  },  // Inner — green
+    { radius: 200,  color: "rgba(0, 150, 200, 0.5)", label: "200m" },  // Middle — blue
+    { radius: 1000, color: "rgba(80, 80, 200, 0.4)", label: "1km"  },  // Outer — purple
+  ];
+
+  ctx.save(); // Save context state so clipping doesn't affect other draws
+  // Clip to just below the ground surface: don't draw rings above ground level
+  // The rings should appear as floor markings, not floating lines above it.
+  ctx.beginPath();
+  ctx.rect(0, padY, canvasWidth, canvasHeight - padY + 30); // Ground + 30px below
+  ctx.clip();
+
+  for (const ring of rings) {
+    // Convert world radius (meters) to screen radius (pixels) using the camera zoom.
+    // camera.worldLengthToPixels(m) = m × camera.zoom (no perspective transform needed).
+    const screenRadius = camera.worldLengthToPixels(ring.radius);
+
+    // Skip rings smaller than 3 pixels (invisible at current zoom level)
+    // or larger than 1.5× the canvas width (would extend way off screen)
+    if (screenRadius < 3 || screenRadius > canvasWidth * 1.5) continue;
+
+    // Draw the ring as a circle ellipse compressed to appear on the flat ground.
+    // A circle on flat ground appears as an ellipse when viewed from the side.
+    // The vertical radius is 20% of the horizontal radius to simulate perspective.
+    ctx.strokeStyle = ring.color;
+    ctx.lineWidth = Math.max(1, Math.min(3, screenRadius / 30)); // Scale line width with ring size
+    ctx.beginPath();
+    ctx.ellipse(
+      padX, padY,           // Center at launch pad screen position
+      screenRadius,          // Horizontal radius (full world radius in screen pixels)
+      screenRadius * 0.12,   // Vertical radius: compressed 88% to simulate flat-floor perspective
+      0,                     // No rotation
+      0, Math.PI * 2         // Full circle
+    );
+    ctx.stroke();
+
+    // Distance label at the right edge of the ring (where the ring crosses the ground line)
+    // Only label rings with enough screen radius to have visible text
+    if (screenRadius > 30) {
+      ctx.fillStyle = ring.color;
+      ctx.font = "9px monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(ring.label, padX + screenRadius + 3, padY + 3);
+    }
+  }
+
+  ctx.restore(); // Restore clipping state
+
+  // Center crosshair: tiny cross at the exact pad center (always drawn, no clipping)
+  const crossSize = 6; // Crosshair arm length in pixels
+  ctx.strokeStyle = "rgba(255, 255, 100, 0.9)"; // Yellow: stands out against green ground
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(padX - crossSize, padY);
+  ctx.lineTo(padX + crossSize, padY);
+  ctx.moveTo(padX, padY - crossSize);
+  ctx.lineTo(padX, padY + crossSize);
+  ctx.stroke();
 }

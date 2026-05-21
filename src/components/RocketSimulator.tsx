@@ -92,6 +92,8 @@ import {
   drawMaxQFlash,
   drawWarningBanner,
   drawStructuralFailureOverlay,
+  drawAltitudeMarkers,
+  drawLandingTarget,
   type Star,
   type AtmosphericTelemetry, // NEW: data bundle passed to telemetry and rocket draw functions
 } from "../utils/drawHelpers";
@@ -155,6 +157,39 @@ function cloneRocketConfig(config: MultiStageRocketConfig): MultiStageRocketConf
     // Each stage is spread into a new object so mutations don't affect the original.
     stages: config.stages.map((stage) => ({ ...stage })),
   };
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+/**
+ * Convert a numeric landing score (0–100) to an academic letter grade.
+ * Used in the landing modal for an immediately-readable quality summary.
+ *
+ * Grading scale:
+ *   97-100 → A+   Perfect: nearly zero impact velocity
+ *   93-96  → A    Excellent soft landing
+ *   90-92  → A-
+ *   87-89  → B+
+ *   83-86  → B    Good — reusable with minor inspection
+ *   80-82  → B-
+ *   77-79  → C+
+ *   73-76  → C    Acceptable — hardware survived
+ *   70-72  → C-
+ *   60-69  → D    Hard landing — significant damage
+ *   0-59   → F    Crash — total loss
+ */
+function getLetterGrade(score: number): string {
+  if (score >= 97) return "A+";
+  if (score >= 93) return "A";
+  if (score >= 90) return "A-";
+  if (score >= 87) return "B+";
+  if (score >= 83) return "B";
+  if (score >= 80) return "B-";
+  if (score >= 77) return "C+";
+  if (score >= 73) return "C";
+  if (score >= 70) return "C-";
+  if (score >= 60) return "D";
+  return "F";
 }
 
 // ─── COMPONENT ───────────────────────────────────────────────────────────────
@@ -306,6 +341,19 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   const customGoalAltitudeRef  = useRef<number | null>(null);
   const showPerfStatsRef       = useRef<boolean>(DEBUG_MODE);
 
+  // ── MISSION LOG REF ──────────────────────────────────────────────────────────
+  // Records key flight events with timestamps for the mission log overlay.
+  // Stored as a ref so the game loop can append to it without re-render overhead.
+  // Synced to React state every 10 frames so the overlay updates periodically.
+  const missionLogRef = useRef<Array<{ time: number; message: string }>>([]);
+
+  // Edge-trigger flags — detect first-time transitions for log events.
+  const loggedIgnitionRef  = useRef<boolean>(false); // True after first ignition logged
+  const loggedLiftoffRef   = useRef<boolean>(false); // True after first liftoff logged
+  const loggedMaxQRef      = useRef<boolean>(false); // True after Max-Q passage logged
+  const loggedParaRef      = useRef<boolean>(false); // True after parachute deploy logged
+  const prevStageSepRef    = useRef<number>(0);       // Previous stage separation count
+
   // ── REACT STATE (for DOM / UI rendering) ─────────────────────────────────────
 
   // Current rocket config used for the select box and reset logic.
@@ -384,6 +432,12 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   const [audioMuted,   setAudioMuted]   = useState<boolean>(false);
   const [masterVolume, setMasterVolume] = useState<number>(0.5);
 
+  // Mission log: synced from missionLogRef every 10 frames for the overlay.
+  const [missionLog, setMissionLog] = useState<Array<{ time: number; message: string }>>([]);
+
+  // Keyboard shortcuts help overlay (toggle with ? key).
+  const [showKeyboardHelp, setShowKeyboardHelp] = useState<boolean>(false);
+
   // ── SYNC: React state → Refs ──────────────────────────────────────────────
   // These tiny effects write updated React state values into the corresponding refs
   // so the game loop (which only reads refs) always has current values without
@@ -461,9 +515,10 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       else if (e.key === "0") { setIsPaused((p) => !p); } // Toggle pause
 
       // ── UI controls ──
-      if (e.key === "Escape") setShowFullscreenTrajectory(false); // Close fullscreen trajectory
+      if (e.key === "Escape") { setShowFullscreenTrajectory(false); setShowKeyboardHelp(false); }
       if (e.key === " ")      e.preventDefault(); // Prevent SPACEBAR from scrolling the page
       if (e.key === "p" || e.key === "P") setShowPerfStats((p) => !p); // Toggle perf stats
+      if (e.key === "?" || e.key === "/") setShowKeyboardHelp((h) => !h); // Toggle help overlay
       if (e.key === "m" || e.key === "M") { // Toggle audio mute
         const muted = audioManagerRef.current.toggleMute();
         setAudioMuted(muted);
@@ -711,6 +766,44 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           stagnationTemperature: stagnationTemp, // K — nose cone temperature
         };
 
+        // ── MISSION LOG EVENT DETECTION (first sub-step only) ────────────────
+        if (step === 0) {
+          const t = frame.state.timeElapsed; // Current mission elapsed time (seconds)
+
+          // IGNITION: first time throttle goes above zero
+          const activeStgForLog = config.stages.find((s) => s.isActive && !s.isSeparated);
+          if (!loggedIgnitionRef.current && activeStgForLog && activeStgForLog.thrustPercentage > 0) {
+            loggedIgnitionRef.current = true;
+            missionLogRef.current.push({ time: t, message: "IGNITION" });
+          }
+
+          // LIFTOFF: first time rocket actually leaves the ground (upward velocity)
+          if (!loggedLiftoffRef.current && frame.state.isFlying && frame.state.velocity.y > 2) {
+            loggedLiftoffRef.current = true;
+            missionLogRef.current.push({ time: t, message: "LIFTOFF" });
+          }
+
+          // STAGING: detect new stage separations by comparing count
+          if (frame.state.stageSeparationCount > prevStageSepRef.current) {
+            const stageNum = frame.state.stageSeparationCount;
+            missionLogRef.current.push({ time: t, message: `STAGE ${stageNum} SEP` });
+            prevStageSepRef.current = frame.state.stageSeparationCount;
+          }
+
+          // MAX-Q PASSAGE: when maxQPassedRef flips to true
+          if (!loggedMaxQRef.current && maxQPassedRef.current) {
+            loggedMaxQRef.current = true;
+            const qKpa = (currentAtmoDataRef.current.maxDynamicPressure / 1000).toFixed(1);
+            missionLogRef.current.push({ time: t, message: `MAX-Q ${qKpa} kPa` });
+          }
+
+          // PARACHUTE DEPLOY
+          if (!loggedParaRef.current && parachuteDeployedRef.current) {
+            loggedParaRef.current = true;
+            missionLogRef.current.push({ time: t, message: "CHUTE DEPLOYED" });
+          }
+        }
+
         // ── AUDIO: ENGINE SOUNDS (only on first sub-step to avoid sound spam) ──
         if (step === 0) {
           const activeStg  = config.stages.find((s) => s.isActive && !s.isSeparated);
@@ -798,6 +891,13 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           // if the player hits Reset, trajectoryBufferRef is cleared but this snapshot persists.
           // The snapshot is used as the gold comparison line in the Monte Carlo trajectory plot.
           playerTrajectoryRef.current = [...trajectoryBufferRef.current];
+
+          // Log the touchdown event with landing velocity
+          const landV = Math.abs(frame.state.landingVelocity).toFixed(1);
+          missionLogRef.current.push({
+            time: frame.state.timeElapsed,
+            message: `TOUCHDOWN ${landV} m/s`,
+          });
 
           // Landing visual effects.
           if (score > 50) {
@@ -904,6 +1004,10 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       // 3. Ground surface line at world Y=0.
       drawGround(ctx, cw, ch, camera);
 
+      // 3a. Landing target bullseye circles centered on launch pad (x=0, y=0).
+      // Only visible when the camera can see the ground area.
+      drawLandingTarget(ctx, cw, ch, camera);
+
       // 4. Exhaust particles and stage-separation burst.
       particleSystemRef.current.draw(ctx, camera, cw, ch);
 
@@ -960,7 +1064,12 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         drawStructuralFailureOverlay(ctx, cw, ch); // Red overlay with failure message
       }
 
-      // 8. Debug performance panel (top-left, toggle with P key).
+      // 11a. Altitude markers ribbon on the right edge.
+      // Drawn after all world-space elements but before DOM-overlaid HUD elements.
+      drawAltitudeMarkers(ctx, cw, ch, camera);
+
+      // 11. Debug performance panel (top-left, toggle with P key).
+      // Drawn last so it appears on top of every other overlay.
       if (showPerfStatsRef.current) {
         drawPerfStats(ctx, performanceMonitorRef.current.getMetrics());
       }
@@ -991,6 +1100,11 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           [...trajectoryBufferRef.current] // Pass a copy — limiter may truncate
         );
         setTrajectoryHistory(limited);
+
+        // Sync mission log to React state (only if it has changed recently).
+        // We snapshot the last 8 entries — enough to show all key flight events.
+        const logSnapshot = missionLogRef.current.slice(-8);
+        setMissionLog([...logSnapshot]);
       }
 
       // Schedule next frame via rAF.
@@ -1083,6 +1197,15 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
     // Clear structural failure latch — rocket is intact for the new flight.
     isStructuralFailureRef.current = false; // No structural failure
+
+    // Reset mission log for the new flight.
+    missionLogRef.current = [];
+    setMissionLog([]);
+    loggedIgnitionRef.current  = false;
+    loggedLiftoffRef.current   = false;
+    loggedMaxQRef.current      = false;
+    loggedParaRef.current      = false;
+    prevStageSepRef.current    = 0;
 
     // Cancel any in-progress Monte Carlo simulation so it doesn't call setState
     // on an unmounted or reset component. Then clear all MC UI state.
@@ -1492,14 +1615,25 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         >
           <h2 style={{ marginTop: 0, color: COLORS.trajectory }}>Landing Report</h2>
 
-          {/* Score — big colored number */}
-          <div style={{
-            fontSize: "48px",
-            fontWeight: "bold",
-            color: landingScore >= 80 ? "#44ff44" : landingScore >= 50 ? "#ffaa00" : "#ff4444",
-            margin: "8px 0",
-          }}>
-            {landingScore.toFixed(0)}<span style={{ fontSize: "20px" }}>/100</span>
+          {/* Score — big colored number alongside letter grade */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "16px", margin: "8px 0" }}>
+            <div style={{
+              fontSize: "48px",
+              fontWeight: "bold",
+              color: landingScore >= 80 ? "#44ff44" : landingScore >= 50 ? "#ffaa00" : "#ff4444",
+            }}>
+              {landingScore.toFixed(0)}<span style={{ fontSize: "20px" }}>/100</span>
+            </div>
+            {/* Letter grade — large, color-matched, right of the numeric score */}
+            <div style={{
+              fontSize: "42px",
+              fontWeight: "bold",
+              color: landingScore >= 80 ? "#44ff44" : landingScore >= 50 ? "#ffaa00" : "#ff4444",
+              borderLeft: "2px solid rgba(74,111,165,0.5)",
+              paddingLeft: "16px",
+            }}>
+              {getLetterGrade(landingScore)}
+            </div>
           </div>
 
           {/* Quality label */}
@@ -1821,6 +1955,126 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           }
           onClose={() => setShowMCPanel(false)}          // Return to manual flight view
         />
+      )}
+
+      {/* ── MISSION LOG PANEL ────────────────────────────────────────────────── */}
+      {/* Shows key flight events (Ignition, Liftoff, Staging, Max-Q, etc.) with
+          elapsed mission time in T+HH:MM:SS format. Positioned bottom-right above
+          the telemetry HUD so it doesn't overlap controls. */}
+      {missionLog.length > 0 && !showMCPanel && (
+        <div
+          style={{
+            position:        "absolute",
+            bottom:          "220px",
+            right:           "12px",
+            width:           "180px",
+            backgroundColor: "rgba(4, 8, 22, 0.75)",
+            border:          `1px solid rgba(74, 111, 165, 0.4)`,
+            borderRadius:    "4px",
+            padding:         "6px 8px",
+            fontFamily:      "monospace",
+            fontSize:        "10px",
+            zIndex:          10,
+            backdropFilter:  "blur(2px)",
+          }}
+        >
+          {/* Panel title */}
+          <div style={{ color: COLORS.trajectory, fontWeight: "bold", marginBottom: "4px", fontSize: "9px", letterSpacing: "1px" }}>
+            MISSION LOG
+          </div>
+          {/* Log entries — newest at the bottom (chronological order) */}
+          {missionLog.map((entry, i) => {
+            const t = entry.time;
+            const h = Math.floor(t / 3600);
+            const m = Math.floor((t % 3600) / 60);
+            const s = (t % 60).toFixed(0).padStart(2, "0");
+            const timeStr = h > 0
+              ? `T+${h}:${String(m).padStart(2,"0")}:${s}`
+              : `T+${String(m).padStart(2,"0")}:${s}`;
+            return (
+              <div key={i} style={{ display: "flex", gap: "6px", color: "rgba(180, 210, 240, 0.9)", paddingBottom: "2px" }}>
+                <span style={{ color: "rgba(100, 150, 200, 0.7)", minWidth: "50px" }}>{timeStr}</span>
+                <span>{entry.message}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ── KEYBOARD SHORTCUTS HELP OVERLAY ──────────────────────────────────── */}
+      {/* Toggles with ? or / key. Shows all keyboard controls in a centered panel.
+          ESC or clicking outside also closes it. */}
+      {showKeyboardHelp && (
+        <div
+          onClick={() => setShowKeyboardHelp(false)} // Click backdrop to dismiss
+          style={{
+            position:        "fixed",
+            inset:           0,
+            backgroundColor: "rgba(0, 0, 0, 0.6)",
+            zIndex:          50,
+            display:         "flex",
+            alignItems:      "center",
+            justifyContent:  "center",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()} // Prevent click-through to backdrop
+            style={{
+              backgroundColor: "rgba(5, 10, 30, 0.97)",
+              border:          `2px solid ${COLORS.ui}`,
+              borderRadius:    "6px",
+              padding:         "20px 28px",
+              minWidth:        "360px",
+              fontFamily:      "monospace",
+              color:           COLORS.text,
+              backdropFilter:  "blur(8px)",
+            }}
+          >
+            <h3 style={{ margin: "0 0 14px 0", color: COLORS.trajectory, fontSize: "15px" }}>
+              Keyboard Shortcuts
+            </h3>
+            {/* Shortcut table */}
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
+              <tbody>
+                {([
+                  ["SPACE",       "Apply thrust burst"],
+                  ["A / ←",       "Steer left"],
+                  ["D / →",       "Steer right"],
+                  ["0",           "Pause / Resume"],
+                  ["1",           "1× speed"],
+                  ["2",           "2× speed"],
+                  ["3",           "5× speed"],
+                  ["4",           "10× speed"],
+                  ["P",           "Toggle performance stats"],
+                  ["M",           "Toggle audio mute"],
+                  ["? or /",      "This help screen"],
+                  ["ESC",         "Close panels"],
+                ] as [string, string][]).map(([key, desc]) => (
+                  <tr key={key}>
+                    <td style={{ padding: "3px 0", width: "90px" }}>
+                      <span style={{
+                        display:         "inline-block",
+                        backgroundColor: "rgba(74, 111, 165, 0.25)",
+                        border:          `1px solid ${COLORS.ui}`,
+                        borderRadius:    "3px",
+                        padding:         "1px 6px",
+                        fontWeight:      "bold",
+                        color:           COLORS.trajectory,
+                        fontSize:        "11px",
+                      }}>
+                        {key}
+                      </span>
+                    </td>
+                    <td style={{ padding: "3px 0", color: "rgba(200, 215, 240, 0.85)" }}>{desc}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ marginTop: "14px", fontSize: "10px", opacity: 0.5, textAlign: "center" }}>
+              Press ? or ESC to close
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
