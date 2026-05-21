@@ -116,10 +116,29 @@ function cloneRocketConfig(config: MultiStageRocketConfig): MultiStageRocketConf
 // ─── COMPONENT ───────────────────────────────────────────────────────────────
 
 /**
+ * Props accepted by RocketSimulator.
+ * Both props are optional so existing call-sites with no props continue to work.
+ */
+interface RocketSimulatorProps {
+  // initialConfig: if provided (from RocketBuilder after launching), the simulator
+  // uses this custom rocket instead of the default Simple Two-Stage.
+  // If undefined, the simulator starts with ROCKET_SIMPLE_TWO_STAGE as before.
+  initialConfig?: MultiStageRocketConfig;
+
+  // onSwitchToBuildMode: called when the user selects "Build Custom" from the
+  // rocket dropdown, asking App.tsx to switch to BUILD mode.
+  // If undefined, the "Build Custom" option is still shown but does nothing.
+  onSwitchToBuildMode?: () => void;
+}
+
+/**
  * RocketSimulator — the top-level component.
  * Renders a fullscreen canvas with a game loop and React DOM overlays.
  */
-export const RocketSimulator: React.FC = () => {
+export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
+  initialConfig,        // Optional custom config from the builder; undefined = use default
+  onSwitchToBuildMode,  // Optional callback to switch App.tsx to BUILD mode
+}) => {
 
   // ── CANVAS REF ──────────────────────────────────────────────────────────────
   // Direct reference to the <canvas> DOM element used for rendering.
@@ -135,10 +154,12 @@ export const RocketSimulator: React.FC = () => {
   // The game loop reads from refs so it doesn't need to be in the useEffect
   // dependency array, which would restart the loop on every state change.
 
-  // Initial rocket config: start with a clone of the simple two-stage config.
-  // We clone so physics mutations (fuel burn) don't corrupt the exported constant.
+  // Initial rocket config: use the custom config from the builder if provided,
+  // otherwise fall back to the built-in Simple Two-Stage preset.
+  // We always clone so physics mutations (fuel burn) don't corrupt the source object.
   const rocketConfigRef = useRef<MultiStageRocketConfig>(
-    cloneRocketConfig(ROCKET_SIMPLE_TWO_STAGE) // Clone to prevent constant mutation
+    cloneRocketConfig(initialConfig ?? ROCKET_SIMPLE_TWO_STAGE)
+    // ?? ROCKET_SIMPLE_TWO_STAGE: nullish coalescing — only falls back when initialConfig is undefined/null
   );
 
   // Flight state: position, velocity, angle, and all in-flight metrics.
@@ -711,6 +732,13 @@ export const RocketSimulator: React.FC = () => {
   const handleRocketChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
     const name = e.target.value;
 
+    // "Build Custom" is not a preset — it asks App.tsx to switch to BUILD mode instead.
+    // onSwitchToBuildMode is the callback passed in as a prop from App.tsx.
+    if (name === "Build Custom") {
+      onSwitchToBuildMode?.(); // Optional chaining: safe to call even if prop is undefined
+      return;                   // Don't try to load a config for this virtual option
+    }
+
     // Find the selected config constant.
     let baseConfig: MultiStageRocketConfig | null = null;
     if (name === "Simple Two-Stage")   baseConfig = ROCKET_SIMPLE_TWO_STAGE;
@@ -886,6 +914,8 @@ export const RocketSimulator: React.FC = () => {
             <option value="Simple Two-Stage">Simple Two-Stage</option>
             <option value="Falcon 9 Inspired">Falcon 9 Inspired</option>
             <option value="Three-Stage Heavy">Three-Stage Heavy</option>
+            {/* Sentinel option: selecting this calls onSwitchToBuildMode via handleRocketChange */}
+            <option value="Build Custom">⚙ Build Custom...</option>
           </select>
         </div>
 
