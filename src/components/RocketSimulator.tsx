@@ -92,6 +92,21 @@ import {
   type Star,
 } from "../utils/drawHelpers";
 
+// Import Monte Carlo simulation engine and supporting types.
+// runMonteCarloSimulation: async runner that yields between runs to keep UI responsive.
+// createDefaultMonteCarloConfig: factory for the default dispersion settings.
+// MonteCarloConfig / MonteCarloResults: TypeScript interfaces for configuration and results.
+import {
+  runMonteCarloSimulation,
+  createDefaultMonteCarloConfig,
+  type MonteCarloConfig,
+  type MonteCarloResults,
+} from "../physics/MonteCarloSimulator";
+
+// Import the full-screen Monte Carlo results visualization panel.
+// This component renders the trajectory overlay plot, histograms, pie chart, and run table.
+import { MonteCarloPanel } from "./MonteCarloPanel";
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 /**
@@ -258,6 +273,36 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
   // Whether the fullscreen trajectory view is open.
   const [showFullscreenTrajectory, setShowFullscreenTrajectory] = useState<boolean>(false);
+
+  // ── MONTE CARLO STATE ─────────────────────────────────────────────────────
+  // Controls visibility of the Monte Carlo configuration panel (pre-run setup).
+  // Set to true when the user clicks "Monte Carlo Analysis" in the landing modal.
+  const [showMCConfig, setShowMCConfig] = useState<boolean>(false);
+
+  // Controls visibility of the full-screen Monte Carlo results panel.
+  // Set to true once all simulation runs complete and results are ready.
+  const [showMCPanel, setShowMCPanel] = useState<boolean>(false);
+
+  // The user-configurable Monte Carlo parameters: number of runs, dispersion ranges, failures.
+  // Initialized from createDefaultMonteCarloConfig() which applies real aerospace tolerances.
+  const [mcConfig, setMCConfig] = useState<MonteCarloConfig>(() => createDefaultMonteCarloConfig());
+
+  // The computed results from the last completed Monte Carlo batch.
+  // null before any simulation has been run; set once all runs complete.
+  const [mcResults, setMCResults] = useState<MonteCarloResults | null>(null);
+
+  // Simulation progress: how many runs have completed out of the total.
+  // null when not simulating; set to { completed, total } during active simulation.
+  const [mcProgress, setMCProgress] = useState<{ completed: number; total: number } | null>(null);
+
+  // Cancellation handle returned by runMonteCarloSimulation().
+  // Calling mcCancelRef.current?.() aborts the simulation mid-run if the user navigates away.
+  const mcCancelRef = useRef<(() => void) | null>(null);
+
+  // Snapshot of the player's manual flight trajectory at the moment of landing.
+  // Populated when the rocket lands; used as the gold comparison line in the MC plot.
+  // We store a copy (not a ref to the buffer) so it persists after the buffer is cleared on reset.
+  const playerTrajectoryRef = useRef<Array<{ x: number; y: number }>>([]);
 
   // Audio UI state.
   const [audioMuted,   setAudioMuted]   = useState<boolean>(false);
@@ -521,6 +566,12 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           setLandingScore(score);
           setLandingState({ ...updatedLanding });
 
+          // Snapshot the player's flight trajectory at the moment of landing.
+          // We spread the buffer into a new array so this copy is independent —
+          // if the player hits Reset, trajectoryBufferRef is cleared but this snapshot persists.
+          // The snapshot is used as the gold comparison line in the Monte Carlo trajectory plot.
+          playerTrajectoryRef.current = [...trajectoryBufferRef.current];
+
           // Landing visual effects.
           if (score > 50) {
             // Soft landing: small dust puff.
@@ -726,6 +777,18 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
     // Reset performance monitor stats.
     performanceMonitorRef.current.reset();
     setShowFullscreenTrajectory(false);
+
+    // Cancel any in-progress Monte Carlo simulation so it doesn't call setState
+    // on an unmounted or reset component. Then clear all MC UI state.
+    mcCancelRef.current?.();              // Abort the async simulation loop
+    mcCancelRef.current = null;           // Clear the stale cancel handle
+    setShowMCConfig(false);              // Close config panel if open
+    setShowMCPanel(false);               // Close results panel if open
+    setMCProgress(null);                 // Clear progress bar
+    // Note: we intentionally keep mcResults so the user can reopen the last
+    // results panel via "Monte Carlo Analysis" in the new landing modal.
+    // Clear playerTrajectoryRef so a fresh flight starts without the old comparison line.
+    playerTrajectoryRef.current = [];
   }, []); // No deps — all game data accessed via refs
 
   /** Switch to a different rocket type. */
@@ -1125,8 +1188,8 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             </tbody>
           </table>
 
-          {/* Dismiss / Reset buttons */}
-          <div style={{ display: "flex", gap: "10px", marginTop: "16px", justifyContent: "center" }}>
+          {/* Dismiss / Reset / Monte Carlo buttons */}
+          <div style={{ display: "flex", gap: "10px", marginTop: "16px", justifyContent: "center", flexWrap: "wrap" }}>
             <button
               onClick={() => setLandingScore(null)} // Dismiss modal but keep the landed state
               style={{
@@ -1145,8 +1208,281 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             >
               ↺ Fly Again
             </button>
+            {/* Monte Carlo button: opens the configuration panel to set up parallel simulations.
+                Only shown after landing so the user has a manual flight to compare against.
+                The ⚡ lightning bolt visually signals "run a batch of simulations now." */}
+            <button
+              onClick={() => {
+                setLandingScore(null);    // Close landing modal to reduce UI clutter
+                setShowMCConfig(true);    // Open Monte Carlo configuration panel
+              }}
+              style={{
+                ...btnStyle(true, "#1a5c38"), // Dark green: distinct from UI blue
+                padding: "6px 16px",
+              }}
+              title="Run multiple automated simulations to see the range of possible outcomes"
+            >
+              ⚡ Parallel Simulations
+            </button>
           </div>
         </div>
+      )}
+      {/* ── MONTE CARLO CONFIGURATION PANEL ────────────────────────────────────── */}
+      {/* Modal dialog for setting up the Monte Carlo simulation before running.
+          Lets the user choose: number of runs, whether to include failures, and failure rate.
+          Appears after the user clicks "⚡ Parallel Simulations" in the landing modal. */}
+      {showMCConfig && (
+        <div
+          style={{
+            position:        "absolute",
+            top:             "50%",
+            left:            "50%",
+            transform:       "translate(-50%, -50%)", // Perfectly centered on viewport
+            backgroundColor: "rgba(4, 8, 22, 0.98)",
+            border:          `2px solid ${COLORS.ui}`,
+            borderRadius:    "6px",
+            padding:         "20px 24px",
+            minWidth:        "340px",
+            zIndex:          25,                      // Above landing modal (z=20) and canvas
+            backdropFilter:  "blur(8px)",
+            fontFamily:      "monospace",
+            color:           "#e0e8ff",
+          }}
+        >
+          {/* Config panel title */}
+          <h3 style={{ marginTop: 0, color: COLORS.trajectory, fontSize: 15 }}>
+            Monte Carlo Analysis Configuration
+          </h3>
+
+          {/* Brief explanation of what Monte Carlo analysis does */}
+          <p style={{ fontSize: 11, opacity: 0.65, margin: "0 0 16px 0", lineHeight: 1.5 }}>
+            Runs N automated simulations of <strong>{rocketConfig.name}</strong> with randomized
+            thrust (±3%), mass (±2%), fuel loading (±1%), wind (0-15 m/s), and Isp (±1.5%)
+            variations to show the statistical range of possible trajectories.
+          </p>
+
+          {/* Number of runs selector */}
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ fontSize: 12, display: "block", marginBottom: 6 }}>
+              Number of simulation runs:
+            </label>
+            <div style={{ display: "flex", gap: 8 }}>
+              {/* Four preset run counts — more runs = better statistics but takes longer */}
+              {([10, 25, 50, 100] as const).map(n => (
+                <button
+                  key={n}
+                  onClick={() => setMCConfig(prev => ({ ...prev, numberOfRuns: n }))}
+                  style={{
+                    flex:            1,
+                    padding:         "5px 0",
+                    backgroundColor: mcConfig.numberOfRuns === n
+                      ? COLORS.ui           // Active/selected: accent blue
+                      : "rgba(10, 20, 50, 0.8)", // Inactive: dark background
+                    color:           mcConfig.numberOfRuns === n ? "#fff" : "#aabbcc",
+                    border:          `1px solid ${mcConfig.numberOfRuns === n ? COLORS.ui : "rgba(74,111,165,0.4)"}`,
+                    borderRadius:    3,
+                    cursor:          "pointer",
+                    fontFamily:      "monospace",
+                    fontSize:        13,
+                    fontWeight:      mcConfig.numberOfRuns === n ? "bold" : "normal",
+                  }}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+            {/* Hint about trade-off between speed and statistical accuracy */}
+            <div style={{ fontSize: 10, opacity: 0.5, marginTop: 4 }}>
+              More runs = better statistics. 50 runs takes ~2-3 seconds.
+            </div>
+          </div>
+
+          {/* Include failure scenarios toggle */}
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={mcConfig.includeFailureScenarios} // Controlled by mcConfig state
+                onChange={e => setMCConfig(prev => ({
+                  ...prev,
+                  includeFailureScenarios: e.target.checked, // Toggle failure injection
+                }))}
+                style={{ cursor: "pointer", accentColor: COLORS.ui }}
+              />
+              Include failure scenarios (engine shutdown, fuel leak, structural, guidance)
+            </label>
+          </div>
+
+          {/* Failure probability slider — only shown when failures are enabled */}
+          {mcConfig.includeFailureScenarios && (
+            <div style={{ marginBottom: 14 }}>
+              <label style={{ fontSize: 12, display: "block", marginBottom: 4 }}>
+                Failure probability:{" "}
+                <strong style={{ color: "#ffaa44" }}>
+                  {(mcConfig.failureProbability * 100).toFixed(0)}%
+                </strong>
+                {" "}(~{Math.round(mcConfig.numberOfRuns * mcConfig.failureProbability)} of {mcConfig.numberOfRuns} runs)
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="0.2"       // 0% to 20% failure probability
+                step="0.01"     // 1% increments
+                value={mcConfig.failureProbability}
+                onChange={e => setMCConfig(prev => ({
+                  ...prev,
+                  failureProbability: parseFloat(e.target.value),
+                }))}
+                style={{ width: "100%", cursor: "pointer", accentColor: "#ff8844" }}
+              />
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, opacity: 0.5 }}>
+                <span>0% (no failures)</span>
+                <span>20% (1 in 5 fail)</span>
+              </div>
+            </div>
+          )}
+
+          {/* Action buttons: Run or Cancel */}
+          <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+            {/* Cancel: dismiss config panel without running */}
+            <button
+              onClick={() => setShowMCConfig(false)}
+              style={{ ...btnStyle(false), padding: "7px 16px", flex: 1 }}
+            >
+              Cancel
+            </button>
+
+            {/* Run: start the simulation batch */}
+            <button
+              onClick={() => {
+                setShowMCConfig(false); // Close config panel
+
+                // Initialize progress tracking
+                setMCProgress({ completed: 0, total: mcConfig.numberOfRuns });
+
+                // Clone the current rocket config so the MC simulation uses the same
+                // rocket the player just flew (not a stale reference from before reset)
+                const configForMC = cloneRocketConfig(rocketConfigRef.current);
+
+                // Start the async Monte Carlo simulation.
+                // onProgress: called after each run to update the progress bar.
+                // onComplete: called with full results once all runs finish.
+                const { cancel } = runMonteCarloSimulation(
+                  configForMC,
+                  mcConfig,
+                  (completed, total) => {
+                    // Update progress bar — triggers re-render via React state
+                    setMCProgress({ completed, total });
+                  },
+                  (results) => {
+                    // All runs complete — store results and show the panel
+                    setMCResults(results);
+                    setMCProgress(null);     // Clear progress bar
+                    setShowMCPanel(true);    // Open the full results panel
+                  }
+                );
+
+                // Store cancel handle so Reset can abort the simulation
+                mcCancelRef.current = cancel;
+              }}
+              style={{
+                ...btnStyle(true, "#1a5c38"), // Dark green "go" button
+                padding: "7px 16px",
+                flex:    2,
+                fontWeight: "bold",
+              }}
+            >
+              ▶ Run {mcConfig.numberOfRuns} Simulations
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── MONTE CARLO PROGRESS BAR ─────────────────────────────────────────── */}
+      {/* Shown while simulation is running — a progress bar with run count.
+          Positioned in the center-bottom area so it's visible but not intrusive. */}
+      {mcProgress !== null && (
+        <div
+          style={{
+            position:        "absolute",
+            bottom:          60,
+            left:            "50%",
+            transform:       "translateX(-50%)", // Center horizontally
+            backgroundColor: "rgba(4, 8, 22, 0.95)",
+            border:          `1px solid ${COLORS.ui}`,
+            borderRadius:    6,
+            padding:         "10px 18px",
+            minWidth:        260,
+            textAlign:       "center",
+            zIndex:          20,
+            backdropFilter:  "blur(4px)",
+            fontFamily:      "monospace",
+          }}
+        >
+          {/* Progress label */}
+          <div style={{ fontSize: 12, marginBottom: 6, color: COLORS.trajectory }}>
+            Simulating... {mcProgress.completed}/{mcProgress.total} runs complete
+          </div>
+
+          {/* Progress bar track */}
+          <div
+            style={{
+              width:           "100%",
+              height:          6,
+              backgroundColor: "rgba(30, 50, 100, 0.6)",
+              borderRadius:    3,
+              overflow:        "hidden",
+            }}
+          >
+            {/* Progress bar fill — width proportional to completed / total */}
+            <div
+              style={{
+                width:           `${(mcProgress.completed / mcProgress.total) * 100}%`,
+                height:          "100%",
+                backgroundColor: COLORS.trajectory, // Cyan fill
+                borderRadius:    3,
+                transition:      "width 0.2s ease", // Smooth animation as progress updates
+              }}
+            />
+          </div>
+
+          {/* Cancel button */}
+          <button
+            onClick={() => {
+              mcCancelRef.current?.(); // Abort the simulation
+              mcCancelRef.current = null;
+              setMCProgress(null);     // Clear progress bar
+            }}
+            style={{
+              marginTop:       6,
+              padding:         "3px 10px",
+              fontSize:        10,
+              backgroundColor: "rgba(60, 10, 10, 0.8)",
+              color:           "#ff8888",
+              border:          "1px solid rgba(200, 60, 60, 0.4)",
+              borderRadius:    3,
+              cursor:          "pointer",
+              fontFamily:      "monospace",
+            }}
+          >
+            ✕ Cancel
+          </button>
+        </div>
+      )}
+
+      {/* ── MONTE CARLO RESULTS PANEL ─────────────────────────────────────────── */}
+      {/* Full-screen overlay that appears once all simulation runs complete.
+          Contains the trajectory envelope plot, statistics histograms, and run table.
+          The playerTrajectoryRef.current contains the player's flight as the gold comparison line. */}
+      {showMCPanel && mcResults !== null && (
+        <MonteCarloPanel
+          results={mcResults}                            // All runs, statistics, and envelope
+          playerTrajectory={playerTrajectoryRef.current.length > 0
+            ? playerTrajectoryRef.current                // Show player's flight as gold line
+            : undefined                                  // No gold line if player trajectory is empty
+          }
+          onClose={() => setShowMCPanel(false)}          // Return to manual flight view
+        />
       )}
     </div>
   );
