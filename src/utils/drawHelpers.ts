@@ -8,6 +8,7 @@
  * Functions defined here:
  *   drawBackground         — sky gradient that darkens with altitude
  *   drawStars              — 300-star parallax field
+ *   drawGrid               — faint reference grid in world space (always on)
  *   drawGround             — green surface line at world Y=0
  *   drawGoalLine           — dashed altitude target line
  *   drawRocket             — detailed tapered body, fins, porthole, flame, glow
@@ -26,6 +27,69 @@ import { COLORS, FONT_SIZE_SMALL, FONT_SIZE_MEDIUM } from "./constants";
 // Import temperature model to compute stagnation temperature for heating glow.
 // Stagnation temperature = T_ambient × (1 + 0.2 × M²) — how hot the nose cone gets.
 import { getTemperature } from "../physics/AtmosphereModel";
+
+// ─── CANVAS POLYFILLS ─────────────────────────────────────────────────────────
+
+/**
+ * Cross-browser rounded-rectangle path builder.
+ *
+ * WHY THIS EXISTS:
+ *   `ctx.roundRect()` is a newer Canvas 2D API method added in Chrome 99 (2022),
+ *   Safari 15.4 (2022), and Firefox 112 (2023). Older browsers (including many
+ *   Android WebViews and pre-2023 iOS Safari) don't have it.
+ *   If called on an unsupported browser, it throws "ctx.roundRect is not a function"
+ *   and crashes the game loop.
+ *
+ * FALLBACK ALGORITHM:
+ *   We manually construct the same path using:
+ *   - moveTo()  — go to the start of the first flat top edge
+ *   - lineTo()  — draw each flat straight edge
+ *   - arcTo()   — draw each rounded corner as a circular arc
+ *   arcTo(x1, y1, x2, y2, r) draws an arc from the current point, tangent to the
+ *   lines (current→x1,y1) and (x1,y1→x2,y2), with radius r.
+ *   The caller still calls fill() or stroke() after this function.
+ *
+ * DESIGN NOTE: We pass `ctx` rather than using `this` so this works as a plain
+ * function (not a method override), which is simpler and avoids prototype patching.
+ *
+ * @param ctx     Canvas 2D rendering context.
+ * @param x       Left edge of the rectangle (pixels).
+ * @param y       Top edge of the rectangle (pixels).
+ * @param w       Width of the rectangle (pixels).
+ * @param h       Height of the rectangle (pixels).
+ * @param r       Corner radius (pixels). Clamped to half the shorter dimension.
+ */
+function roundRectPath(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number
+): void {
+  // Clamp radius so corners don't overlap on small rectangles.
+  // If width=40 and radius=30, the two corners would eat into each other — cap at 20.
+  const radius = Math.min(r, w / 2, h / 2);
+
+  if (typeof ctx.roundRect === "function") {
+    // Native API is available (Chrome 99+, Safari 15.4+, Firefox 112+): use it directly.
+    ctx.roundRect(x, y, w, h, radius);
+    return;
+  }
+
+  // Fallback: build the rounded rect manually with arcTo().
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);                          // Top edge, left of top-left corner
+  ctx.lineTo(x + w - radius, y);                      // Top edge, right of top-right corner
+  ctx.arcTo(x + w, y,     x + w, y + radius, radius); // Top-right corner arc
+  ctx.lineTo(x + w, y + h - radius);                  // Right edge
+  ctx.arcTo(x + w, y + h, x + w - radius, y + h, radius); // Bottom-right corner arc
+  ctx.lineTo(x + radius, y + h);                      // Bottom edge
+  ctx.arcTo(x, y + h,     x, y + h - radius, radius); // Bottom-left corner arc
+  ctx.lineTo(x, y + radius);                          // Left edge
+  ctx.arcTo(x, y,         x + radius, y, radius);     // Top-left corner arc
+  ctx.closePath();
+}
 
 // ─── ATMOSPHERIC TELEMETRY DATA TYPE ─────────────────────────────────────────
 
@@ -226,6 +290,129 @@ export function generateStars(count: number): Star[] {
     brightness: 0.3 + Math.random() * 0.7, // Brightness range: 0.3–1.0
     layer: Math.floor(Math.random() * 3),   // Layer 0, 1, or 2
   }));
+}
+
+// ─── WORLD GRID ──────────────────────────────────────────────────────────────
+
+/**
+ * Draw a faint reference grid aligned to world-space coordinates.
+ *
+ * PURPOSE:
+ *   Without a grid, the vast empty sky gives the player no sense of scale or distance.
+ *   Real aerospace displays (like the Space Shuttle's primary flight display) overlay
+ *   a background grid to provide spatial reference. This grid does the same:
+ *   it anchors the rocket's position in a measurable space.
+ *
+ * ADAPTIVE SPACING:
+ *   We pick a grid interval that gives roughly 6-8 visible grid lines on screen
+ *   at any zoom level. The algorithm:
+ *     rawInterval = visible_world_height / 7
+ *     magnitude   = 10^floor(log10(rawInterval))      ← order of magnitude
+ *     normalized  = rawInterval / magnitude            ← in range [1, 10)
+ *     gridInterval = magnitude × { 1 if <2, 2 if <5, 5 if <8, 10 otherwise }
+ *
+ *   Example: at altitude 80 km, visible height ≈ 60 km.
+ *     rawInterval = 60,000 / 7 ≈ 8,571 m
+ *     magnitude   = 1,000
+ *     normalized  = 8.57 → picks 10 → gridInterval = 10,000 m = 10 km
+ *   Labels: "10km", "20km", "30km" etc. — always clean round numbers.
+ *
+ * VISUAL DESIGN:
+ *   Very low alpha (0.08–0.12) so the grid recedes behind the rocket and particles.
+ *   Horizontal lines are slightly brighter than vertical (altitude is the primary axis).
+ *   The ground line at y=0 is drawn by drawGround() in a distinct color — we skip it here.
+ *
+ * @param ctx          Canvas 2D context.
+ * @param canvasWidth  Canvas width in pixels.
+ * @param canvasHeight Canvas height in pixels.
+ * @param camera       Active camera (provides world→screen transform and zoom).
+ */
+export function drawGrid(
+  ctx: CanvasRenderingContext2D,
+  canvasWidth: number,
+  canvasHeight: number,
+  camera: Camera
+): void {
+  // ── COMPUTE VISIBLE WORLD RANGE ────────────────────────────────────────────
+  // How many meters are visible vertically and horizontally at the current zoom.
+  // Dividing canvas size by camera.zoom gives the world extent in metres.
+  const visibleWorldH = canvasHeight / camera.zoom; // World metres from bottom to top
+  const visibleWorldW = canvasWidth  / camera.zoom; // World metres from left to right
+
+  // ── CHOOSE ADAPTIVE GRID INTERVAL ─────────────────────────────────────────
+  // Target ~7 horizontal lines. Use the "nice number" rounding algorithm:
+  //   1.5×, 3.5×, 7× boundaries between choices of 1, 2, 5, 10 at each magnitude.
+  const rawInterval = visibleWorldH / 7;
+  if (rawInterval <= 0) return; // Guard: zero or negative interval means no grid
+
+  const magnitude  = Math.pow(10, Math.floor(Math.log10(rawInterval)));
+  const normalized = rawInterval / magnitude;
+  const gridInterval = magnitude * (
+    normalized < 1.5 ? 1 :
+    normalized < 3.5 ? 2 :
+    normalized < 7   ? 5 : 10
+  );
+
+  // ── COMPUTE WORLD BOUNDS VISIBLE ON SCREEN ─────────────────────────────────
+  // The camera's worldToScreen inverse: worldY ≈ camera.y + (something × screenY / zoom)
+  // We approximate by using camera.y as the focus point and adding half the visible range.
+  const topWorldY    = camera.y + visibleWorldH * 0.6;  // World Y at top of screen
+  const bottomWorldY = camera.y - visibleWorldH * 0.6;  // World Y at bottom of screen
+  const leftWorldX   = camera.x - visibleWorldW * 0.6;  // World X at left of screen
+  const rightWorldX  = camera.x + visibleWorldW * 0.6;  // World X at right of screen
+
+  // ── DRAW HORIZONTAL LINES (constant altitude) ─────────────────────────────
+  // Start at the first grid line above the visible bottom.
+  const firstHoriz = Math.ceil(bottomWorldY / gridInterval) * gridInterval;
+
+  ctx.strokeStyle = "rgba(100, 120, 160, 0.09)"; // Very faint blue-grey
+  ctx.lineWidth = 1;
+
+  for (let worldY = firstHoriz; worldY <= topWorldY + gridInterval; worldY += gridInterval) {
+    if (worldY < 0) continue; // Don't draw grid lines below ground (drawGround handles that)
+
+    // Convert world altitude to canvas Y pixel.
+    const { y: screenY } = camera.worldToScreen(camera.x, worldY, canvasWidth, canvasHeight);
+    if (screenY < -5 || screenY > canvasHeight + 5) continue; // Off-screen: skip
+
+    ctx.beginPath();
+    ctx.moveTo(0, screenY);
+    ctx.lineTo(canvasWidth, screenY);
+    ctx.stroke();
+  }
+
+  // ── DRAW VERTICAL LINES (constant horizontal position) ────────────────────
+  const firstVert = Math.ceil(leftWorldX / gridInterval) * gridInterval;
+
+  ctx.strokeStyle = "rgba(80, 100, 140, 0.06)"; // Even fainter for verticals
+  ctx.lineWidth = 1;
+
+  for (let worldX = firstVert; worldX <= rightWorldX + gridInterval; worldX += gridInterval) {
+    // Convert world X to canvas X pixel using worldToScreen.
+    const { x: screenX } = camera.worldToScreen(worldX, camera.y, canvasWidth, canvasHeight);
+    if (screenX < -5 || screenX > canvasWidth + 5) continue; // Off-screen: skip
+
+    ctx.beginPath();
+    ctx.moveTo(screenX, 0);
+    ctx.lineTo(screenX, canvasHeight);
+    ctx.stroke();
+  }
+
+  // ── ORIGIN CROSS ──────────────────────────────────────────────────────────
+  // A slightly brighter cross at the world origin (0, 0) — the launch pad.
+  // Helps the player orient themselves relative to where they started.
+  const { x: originX, y: originY } = camera.worldToScreen(0, 0, canvasWidth, canvasHeight);
+  if (originX >= -5 && originX <= canvasWidth + 5 &&
+      originY >= -5 && originY <= canvasHeight + 5) {
+    ctx.strokeStyle = "rgba(100, 160, 100, 0.15)"; // Faint green at origin
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(originX - 8, originY); // Horizontal arm of cross
+    ctx.lineTo(originX + 8, originY);
+    ctx.moveTo(originX, originY - 8); // Vertical arm of cross
+    ctx.lineTo(originX, originY + 8);
+    ctx.stroke();
+  }
 }
 
 // ─── GROUND ──────────────────────────────────────────────────────────────────
@@ -1220,8 +1407,7 @@ export function drawMaxQFlash(
   ctx.fillStyle = `rgba(0, 0, 0, ${a * 0.6})`; // Dark background, fades with alpha
   const badgeW = 300; // Badge width in pixels
   const badgeH = 60;  // Badge height in pixels
-  ctx.beginPath();
-  ctx.roundRect(cx - badgeW / 2, cy - badgeH / 2, badgeW, badgeH, 8); // Rounded rect
+  roundRectPath(ctx, cx - badgeW / 2, cy - badgeH / 2, badgeW, badgeH, 8); // Cross-browser rounded rect
   ctx.fill(); // Draw dark badge
 
   // ── "MAX-Q" TEXT ──────────────────────────────────────────────────────────
@@ -1347,10 +1533,10 @@ export function drawStructuralFailureOverlay(
   const panelY = (canvasHeight - panelH) / 2; // Centered vertically
 
   ctx.fillStyle = "rgba(15, 0, 0, 0.92)"; // Very dark red panel background
-  ctx.beginPath();
-  ctx.roundRect(panelX, panelY, panelW, panelH, 8); // Rounded corners
+  roundRectPath(ctx, panelX, panelY, panelW, panelH, 8); // Cross-browser rounded rect
   ctx.fill(); // Draw panel
 
+  roundRectPath(ctx, panelX, panelY, panelW, panelH, 8); // Re-path for stroke (fill consumed the path)
   ctx.strokeStyle = "#cc2222"; // Red border
   ctx.lineWidth = 2;
   ctx.stroke(); // Draw border

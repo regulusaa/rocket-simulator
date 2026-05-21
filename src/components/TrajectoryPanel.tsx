@@ -45,7 +45,6 @@
  */
 
 import React, { useEffect, useRef } from "react";
-import type { RocketState } from "../physics/types";
 import {
   PIXELS_PER_METER,
   TRAJECTORY_PANEL_WIDTH,
@@ -67,8 +66,23 @@ import {
  * isFullscreen    — Determines which render mode to use.
  * onCloseFullscreen — Parent callback invoked when the user presses "Close" or ESC.
  */
+/**
+ * Minimal structural subtype of the rocket state needed by this component.
+ * Both RocketState (single-stage) and MultiStageRocketState share these exact fields,
+ * so using this interface instead of importing either concrete type removes the
+ * `as any` cast in RocketSimulator.tsx and keeps TrajectoryPanel decoupled from
+ * the physics layer's specific state shape.
+ */
+interface TrajectoryStateData {
+  position: { x: number; y: number };
+  velocity: { x: number; y: number };
+  hasLanded: boolean;
+  maxAltitudeReached: number;
+  timeElapsed: number;
+}
+
 interface TrajectoryPanelProps {
-  rocketState: RocketState;
+  rocketState: TrajectoryStateData;
   trajectoryHistory: Array<{ x: number; y: number }>;
   isFullscreen: boolean;
   onCloseFullscreen: () => void;

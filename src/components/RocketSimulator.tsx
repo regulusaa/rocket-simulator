@@ -84,6 +84,7 @@ import {
   generateStars,
   drawBackground,
   drawStars,
+  drawGrid,
   drawGround,
   drawGoalLine,
   drawRocket,
@@ -1507,17 +1508,32 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       );
       if (activeStage && activeStage.isThrusting && activeStage.fuelMass > 0) {
         // spawnChance: 1.0 at 1× speed, 0.1 at 10× speed — inversely proportional.
+        // At high time multipliers we generate fewer particles so the system doesn't
+        // accumulate thousands of long-lived smoke particles at once.
         const spawnChance = Math.min(1, 1 / Math.max(1, effectiveMult));
         if (Math.random() < spawnChance) {
-          // Spawn exhaust at the rocket's current position in WORLD SPACE.
+          // Spawn orange/yellow FLAME particles at the rocket's nozzle (world space).
           particleSystemRef.current.createExhaustTrail(
             flightStateRef.current.position.x,
             flightStateRef.current.position.y,
             flightStateRef.current.velocity.x,
             flightStateRef.current.velocity.y,
-            flightStateRef.current.angle,       // NEW: angle so exhaust comes from the nozzle
+            flightStateRef.current.angle,
             activeStage.thrustPercentage
           );
+          // Spawn grey/white SMOKE particles on every 3rd frame (smoke is coarser than flame).
+          // Smoke particles live 3–4× longer than flame particles, so spawning less often
+          // keeps the particle budget balanced: ~3 smoke + ~10 flame per frame.
+          if (Math.random() < 0.35) {
+            particleSystemRef.current.createSmokeTrail(
+              flightStateRef.current.position.x,
+              flightStateRef.current.position.y,
+              flightStateRef.current.velocity.x,
+              flightStateRef.current.velocity.y,
+              flightStateRef.current.angle,
+              activeStage.thrustPercentage
+            );
+          }
         }
       }
 
@@ -1582,6 +1598,11 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
       // 2. Parallax star field (only visible above ~5 km).
       drawStars(ctx, starsRef.current, cw, ch, camera, state.position.y);
+
+      // 2b. World-space reference grid — faint lines at adaptive intervals.
+      // Drawn after stars so the grid sits in front of the star field but behind
+      // ground, rocket, and particles. Very low alpha keeps it unobtrusive.
+      drawGrid(ctx, cw, ch, camera);
 
       // 3. Ground surface line at world Y=0.
       drawGround(ctx, cw, ch, camera);
@@ -2361,7 +2382,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           }}
         >
           <TrajectoryPanel
-            rocketState={displayFlightState as any} // TrajectoryPanel accepts RocketState shape
+            rocketState={displayFlightState}
             trajectoryHistory={trajectoryHistory}
             isFullscreen={false}
             onCloseFullscreen={() => {}}

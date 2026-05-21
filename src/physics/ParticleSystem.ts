@@ -136,6 +136,104 @@ export class ParticleSystem {
   }
 
   /**
+   * Create a lingering smoke trail behind the rocket's exhaust plume.
+   *
+   * WHAT IS EXHAUST SMOKE?
+   *   Real rocket exhaust produces two distinct visual layers:
+   *   1. The FLAME PLUME — hot, luminous, orange/yellow/white.
+   *      This is the combustion zone where propellant burns and expands rapidly.
+   *      It's what createExhaustTrail() produces.
+   *   2. The SMOKE TRAIL — cooler, grey/white, slower-dissipating.
+   *      This is water vapour, unburned carbon particles (soot), and condensed
+   *      exhaust products that cool quickly after leaving the nozzle.
+   *      Hydrogen-fuelled engines (RS-25, RL-10) produce mostly white water vapour.
+   *      Kerosene-fuelled engines (F-1, Merlin) add grey/black soot.
+   *      Solid rockets produce dense white/grey aluminium oxide smoke.
+   *
+   * WHY SEPARATE FROM THE FLAME?
+   *   Smoke particles are intentionally:
+   *   - Larger (3-6 m world radius vs 0.25-0.75 m for flames)
+   *   - Slower (lower velocity — they hang behind the rocket)
+   *   - Longer-lived (1.5-3 s vs 0.4-0.8 s for flames)
+   *   - Grey/white instead of orange/yellow
+   *   This combination produces the characteristic trail that lingers well after
+   *   the rocket has passed — visible from the ground for minutes on real launches.
+   *
+   * DENSITY SCALING:
+   *   We create fewer smoke particles than flame particles (3-6 vs 12+ for flames).
+   *   This keeps the particle count manageable since smoke particles live 4× longer.
+   *
+   * @param rocketX      Rocket nozzle X position in world metres.
+   * @param rocketY      Rocket nozzle Y position in world metres.
+   * @param rocketVX     Rocket's horizontal velocity (m/s) — smoke inherits a fraction.
+   * @param rocketVY     Rocket's vertical velocity (m/s) — smoke inherits a fraction.
+   * @param rocketAngle  Tilt angle in radians (0 = vertical).
+   * @param throttlePercent  Current throttle 0–100 — controls density and opacity.
+   */
+  public createSmokeTrail(
+    rocketX: number,
+    rocketY: number,
+    rocketVX: number,
+    rocketVY: number,
+    rocketAngle: number,
+    throttlePercent: number = 50
+  ): void {
+    // No smoke from an engine that's off.
+    if (throttlePercent <= 0) return;
+
+    // Smoke particle count: fewer than flame particles (they live longer, so fewer needed).
+    // At 50% throttle: 3 smoke puffs. At 100%: 5 puffs.
+    const smokeCount = Math.floor((throttlePercent / 100) * 4) + 1;
+
+    // Exhaust direction: opposite to where the rocket nozzle points.
+    // Same nozzle direction as createExhaustTrail().
+    const nozzleDirX = -Math.sin(rocketAngle); // Horizontal component (pointing "down nozzle")
+    const nozzleDirY = -Math.cos(rocketAngle); // Vertical component
+
+    for (let i = 0; i < smokeCount; i++) {
+      // Spawn position: further behind the nozzle than flame particles.
+      // Smoke forms AFTER the flame, where exhaust has already cooled.
+      const spread = (Math.random() - 0.5) * 3; // ±1.5 m perpendicular spread (wider than flame)
+      const spawnX = rocketX + nozzleDirX * 4 + spread * nozzleDirY;
+      const spawnY = rocketY + nozzleDirY * 4 - spread * nozzleDirX;
+
+      // Smoke velocity: much slower than flame — it drifts away rather than shooting out.
+      // Low speed + high lifetime = lingering cloud that stays near the launch trajectory.
+      const smokeSpeed = 2 + Math.random() * 4; // 2–6 m/s (vs 10–30 m/s for flame)
+      const inheritFactor = 0.15; // Inherit only 15% of rocket velocity (smoke detaches quickly)
+
+      const vx =
+        nozzleDirX * smokeSpeed +   // Slow drift in nozzle direction
+        rocketVX * inheritFactor +  // Small fraction of rocket horizontal speed
+        (Math.random() - 0.5) * 2;  // ±1 m/s random dispersion
+
+      const vy =
+        nozzleDirY * smokeSpeed +   // Slow drift along nozzle axis
+        rocketVY * inheritFactor +  // Small fraction of rocket vertical speed
+        (Math.random() - 0.5) * 2;  // ±1 m/s random dispersion
+
+      // SMOKE COLOUR:
+      // Pure white (water vapour plume) at high throttle; grey-white at low throttle.
+      // The grey channel scales with throttle: 180 (mid-grey) at low to 240 (near-white) at high.
+      // In CSS: rgba(R, G, B) = grey when R=G=B. We vary all three together for a greyscale smoke.
+      const greyValue = Math.floor(170 + (throttlePercent / 100) * 70); // 170 (grey) → 240 (white)
+      // Low opacity: smoke is translucent. Real exhaust clouds let light through.
+      const startOpacity = 0.3 + (throttlePercent / 100) * 0.2; // 0.3–0.5 alpha
+      const smokeColor = `rgba(${greyValue}, ${greyValue}, ${greyValue}, ${startOpacity.toFixed(2)})`;
+
+      this.createParticle({
+        x: spawnX,
+        y: spawnY,
+        vx,
+        vy,
+        size: 1.5 + Math.random() * 2.5, // 1.5–4 m radius — much larger than flame particles
+        color: smokeColor,
+        lifetime: 1.5 + Math.random() * 1.5, // 1.5–3 s — significantly longer than 0.4–0.8 s flames
+      });
+    }
+  }
+
+  /**
    * Create exhaust trail particles from the rocket's nozzle.
    * Particles spawn behind the nozzle (opposite to thrust direction) and drift away.
    *

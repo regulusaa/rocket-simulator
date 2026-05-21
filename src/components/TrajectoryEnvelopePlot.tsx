@@ -48,6 +48,32 @@ interface TrajectoryEnvelopePlotProps {
   onRunSelect?: (id: number) => void;                     // Called when user clicks near a run
 }
 
+// ─── POLYFILL ──────────────────────────────────────────────────────────────────
+
+/**
+ * Cross-browser rounded-rectangle path builder.
+ * ctx.roundRect() only exists in Chrome 99+/Firefox 112+/Safari 15.4+.
+ * Falls back to arcTo() on older browsers so the tooltip renders everywhere.
+ */
+function roundRectPathLocal(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number, r: number
+): void {
+  const radius = Math.min(r, w / 2, h / 2);
+  if (typeof ctx.roundRect === 'function') { ctx.beginPath(); ctx.roundRect(x, y, w, h, radius); return; }
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + w - radius, y);
+  ctx.arcTo(x + w, y, x + w, y + radius, radius);
+  ctx.lineTo(x + w, y + h - radius);
+  ctx.arcTo(x + w, y + h, x + w - radius, y + h, radius);
+  ctx.lineTo(x + radius, y + h);
+  ctx.arcTo(x, y + h, x, y + h - radius, radius);
+  ctx.lineTo(x, y + radius);
+  ctx.arcTo(x, y, x + radius, y, radius);
+  ctx.closePath();
+}
+
 // ─── COLORS ────────────────────────────────────────────────────────────────────
 
 // Color palette for the trajectory plot — matches reference Monte Carlo dispersion images
@@ -428,13 +454,15 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
       const tx = tooltip.sx + tw > cw ? tooltip.sx - tw - 10 : tooltip.sx + 10;
       const ty = tooltip.sy - th / 2; // Center vertically on mouse position
 
-      // Tooltip background box
+      // Tooltip background box — use the cross-browser rounded-rect helper.
+      // ctx.roundRect() is only available in Chrome 99+/Firefox 112+/Safari 15.4+;
+      // the helper falls back to arcTo() on older browsers.
       ctx.fillStyle = 'rgba(5, 10, 30, 0.92)'; // Near-opaque dark background
       ctx.strokeStyle = 'rgba(0, 200, 80, 0.8)'; // Green border for nominal
       ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(tx, ty, tw, th, 4); // Rounded corners (4px radius)
+      roundRectPathLocal(ctx, tx, ty, tw, th, 4); // Fill path
       ctx.fill();
+      roundRectPathLocal(ctx, tx, ty, tw, th, 4); // Re-path for stroke
       ctx.stroke();
 
       // Tooltip text
