@@ -21,6 +21,41 @@ import type { MultiStageRocketConfig } from "../physics/MultiStageSystem";
 import type { Parachute, LandingGear } from "../physics/LandingMechanics";
 import type { PerformanceMetrics } from "./PerformanceMonitor";
 import { COLORS, FONT_SIZE_SMALL, FONT_SIZE_MEDIUM } from "./constants";
+// Import temperature model to compute stagnation temperature for heating glow.
+// Stagnation temperature = T_ambient × (1 + 0.2 × M²) — how hot the nose cone gets.
+import { getTemperature } from "../physics/AtmosphereModel";
+
+// ─── ATMOSPHERIC TELEMETRY DATA TYPE ─────────────────────────────────────────
+
+/**
+ * Bundle of atmospheric and structural readings computed each frame.
+ * Passed from the game loop (where physics run) into the draw functions.
+ * Keeping them in one interface avoids adding many individual parameters.
+ */
+export interface AtmosphericTelemetry {
+  /** Current Mach number (dimensionless, 0 = subsonic at rest). */
+  machNumber: number; // e.g., 2.4 = travelling at 2.4× speed of sound
+
+  /** Current dynamic pressure Q = 0.5 × ρ × v² in Pascals. */
+  dynamicPressure: number; // Pa — structural loading from airstream
+
+  /** Peak dynamic pressure (Max-Q) reached this flight in Pascals. */
+  maxDynamicPressure: number; // Pa — the single highest Q recorded
+
+  /** Altitude in meters where Max-Q occurred (for the callout label). */
+  maxQAltitude: number; // m — e.g., 12400 m for Falcon 9
+
+  /** Current acceleration in G-forces (1 G = 9.81 m/s²). */
+  currentGForce: number; // G — e.g., 3.2 G is a heavy fighter-jet turn
+
+  /** Structural integrity 0–100% — how intact the rocket is. */
+  structuralIntegrity: number; // % — 100 = pristine, 0 = broke apart
+
+  /** Nose cone stagnation temperature in Kelvin.
+   *  T_stag = T_ambient × (1 + 0.2 × M²) — kinetic heating formula.
+   *  At Mach 3: ~800 K (orange glow). At Mach 5: ~1800 K (white hot). */
+  stagnationTemperature: number; // K — how hot the nose cone is getting
+}
 
 // ─── STAR TYPE ────────────────────────────────────────────────────────────────
 
@@ -325,7 +360,8 @@ export function drawRocket(
   state: MultiStageRocketState,
   config: MultiStageRocketConfig,
   parachute: Parachute,
-  landingGear: LandingGear
+  landingGear: LandingGear,
+  machNumber: number = 0 // NEW: current Mach number for aerodynamic heating visualization
 ): void {
   // Get screen-space position of the rocket's nozzle (base).
   // state.position represents the bottom of the rocket (nozzle end).
@@ -507,6 +543,89 @@ export function drawRocket(
   ctx.lineWidth = 1;
   ctx.stroke();
 
+  // ── AERODYNAMIC HEATING GLOW ───────────────────────────────────────────────
+  // At high speeds, air molecules pile up in front of the nose cone and can't
+  // get out of the way fast enough. The kinetic energy converts to heat through
+  // compression and friction. This is called aerodynamic (or ram) heating.
+  //
+  // STAGNATION TEMPERATURE: T_stag = T_ambient × (1 + 0.2 × M²)
+  //   - At Mach 2: T_stag ≈ 288 × (1 + 0.8) = 518 K (~245°C) — no visible glow yet
+  //   - At Mach 3: T_stag ≈ 288 × (1 + 1.8) = 806 K (~533°C) — dull orange glow
+  //   - At Mach 5: T_stag ≈ 288 × (1 + 5.0) = 1728 K (~1455°C) — bright orange-white
+  //
+  // Space Shuttle tiles were designed to survive 1650°C (re-entry at Mach 25).
+  // The Columbia disaster occurred because heat shield tiles were damaged at launch.
+  //
+  // We draw the glow as a radial gradient centered on the nose tip — it grows
+  // in size and intensity as Mach number increases above 2.
+  if (machNumber > 2.0 && state.isFlying) {
+    // The nose tip is at local position (0, currentLocalY - nosePx) in the rotated frame.
+    const noseTipY = currentLocalY - nosePx; // Y coordinate of the nose tip in local space
+
+    // Compute ambient temperature at current altitude for stagnation formula.
+    const ambientTemp = getTemperature(state.position.y); // K — ISA temperature at altitude
+
+    // Stagnation temperature: T_stag = T_ambient × (1 + 0.2 × M²)
+    // This is the adiabatic stagnation temperature for a flat plate at Mach M.
+    const stagnationTemp = ambientTemp * (1 + 0.2 * machNumber * machNumber); // K
+
+    // Map stagnation temperature to a 0–1 glow intensity for visual brightness.
+    // Glow starts at 500 K (barely visible red heat) and peaks at 2000 K (white hot).
+    const glowIntensity = Math.min(1.0, Math.max(0, (stagnationTemp - 500) / 1500)); // 0–1
+
+    // Glow radius grows with Mach: larger at higher speeds (bigger shock stand-off).
+    // At Mach 2: nosePx × 0.4; at Mach 5: nosePx × 1.0 (wider shock envelope).
+    const glowRadius = nosePx * 0.2 + nosePx * 0.8 * glowIntensity; // pixels
+
+    // Create a radial gradient centered on the nose tip.
+    // Center is hotter (white/orange), edges fade to transparent.
+    const gradient = ctx.createRadialGradient(
+      0, noseTipY, 0,          // Inner circle: center at nose tip, radius 0
+      0, noseTipY, glowRadius  // Outer circle: center at nose tip, fade radius
+    );
+
+    // Color stops: center = hot white core, middle = orange plasma, edge = transparent.
+    // Temperature → color mapping (approximate blackbody radiation colors):
+    //   600 K: dark red glow
+    //   800 K: orange
+    //   1200 K: bright orange
+    //   1800 K+: orange-white to white
+    const innerAlpha = glowIntensity * 0.9; // Core brightness (0–0.9)
+    const outerAlpha = glowIntensity * 0.4; // Edge brightness (0–0.4)
+
+    // Inner hot core: white/yellow at extreme temperatures, orange at moderate.
+    const coreGreen = Math.round(100 + glowIntensity * 100); // 100–200 green channel
+    const coreBlue = Math.round(glowIntensity * 80); // 0–80 blue channel (hotter = bluer)
+    gradient.addColorStop(0, `rgba(255, ${coreGreen}, ${coreBlue}, ${innerAlpha})`); // Core
+
+    // Mid zone: bright orange plasma ring around the nose.
+    gradient.addColorStop(0.3, `rgba(255, 140, 0, ${outerAlpha * 0.8})`); // Orange ring
+
+    // Edge: transparent — glow fades into darkness around it.
+    gradient.addColorStop(1.0, `rgba(255, 60, 0, 0)`); // Fade to transparent
+
+    // Draw the glow as a filled circle with the radial gradient.
+    ctx.fillStyle = gradient; // Apply gradient fill
+    ctx.beginPath();
+    ctx.arc(0, noseTipY, glowRadius, 0, Math.PI * 2); // Circle centered on nose tip
+    ctx.fill(); // Draw the heating glow
+
+    // If temperature is critical (> 2000 K): add an extra bright inner flash.
+    // Above 2000 K the nose cone material is at its thermal limit — visible as white.
+    if (stagnationTemp > 2000) {
+      const criticalGlow = ctx.createRadialGradient(
+        0, noseTipY, 0, // Center: nose tip
+        0, noseTipY, glowRadius * 0.4 // Small intense inner core
+      );
+      criticalGlow.addColorStop(0, `rgba(255, 240, 200, 0.8)`); // Near-white hot core
+      criticalGlow.addColorStop(1, `rgba(255, 180, 50, 0)`); // Fade out
+      ctx.fillStyle = criticalGlow;
+      ctx.beginPath();
+      ctx.arc(0, noseTipY, glowRadius * 0.4, 0, Math.PI * 2); // Small inner glow
+      ctx.fill(); // Draw critical temperature inner flash
+    }
+  }
+
   // ── FINS: triangular fins at the bottom of the first stage ───────────────
   // Fins are attached at the nozzle (local Y=0) and extend downward and outward.
   if (!config.stages[0].isSeparated) {
@@ -660,8 +779,9 @@ export function drawRocket(
 
 /**
  * Draw the HUD telemetry panel in the bottom-right corner of the canvas.
- * Shows altitude, velocity, fuel, throttle, stage, and status info.
- * Drawn directly on the canvas (not a DOM element) for real-time refresh.
+ * Shows altitude, velocity, fuel, throttle, stage, status, and (when provided)
+ * Mach number, dynamic pressure, Max-Q record, G-forces, structural integrity,
+ * and stagnation temperature.
  *
  * @param ctx              Canvas 2D context.
  * @param canvasWidth      Canvas width in pixels.
@@ -670,6 +790,7 @@ export function drawRocket(
  * @param config           Rocket configuration.
  * @param timeMultiplier   Active time multiplier (0=paused, 1-10=speed).
  * @param isPaused         Whether simulation is currently paused.
+ * @param atmoData         Optional atmospheric & structural telemetry (new systems).
  */
 export function drawTelemetry(
   ctx: CanvasRenderingContext2D,
@@ -678,10 +799,12 @@ export function drawTelemetry(
   state: MultiStageRocketState,
   config: MultiStageRocketConfig,
   timeMultiplier: number,
-  isPaused: boolean
+  isPaused: boolean,
+  atmoData?: AtmosphericTelemetry // NEW: optional atmospheric/structural data
 ): void {
   const panelW = 240; // Panel width in pixels
-  const panelH = 320; // Panel height in pixels
+  // Panel height grows when atmospheric data is present (6 extra rows at 22px each = 132px).
+  const panelH = atmoData ? 450 : 320; // Extra rows for MACH, Q, MAX-Q, G, STRUCT, TEMP
   const margin = 16;  // Gap from canvas edge
 
   // Position panel in the bottom-right corner.
@@ -778,6 +901,99 @@ export function drawTelemetry(
   if (state.hasLanded) { status = "LANDED";   statusColor = "#ffaa00"; }
   line(`STATUS: ${status}`, y, statusColor); y += lh;
 
+  // ── ATMOSPHERIC & STRUCTURAL TELEMETRY (new rows, only when data is available) ──
+  if (atmoData) {
+    // Thin separator line to visually divide legacy telemetry from the new readings.
+    ctx.strokeStyle = "rgba(74, 111, 165, 0.4)"; // Faint blue separator line
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(panelX + 8, panelY + 22 + y - 4); // 4px above the separator position
+    ctx.lineTo(panelX + panelW - 8, panelY + 22 + y - 4); // Across the panel
+    ctx.stroke(); // Draw separator
+
+    // ── MACH NUMBER ────────────────────────────────────────────────────────
+    // Mach number = vehicle speed / local speed of sound.
+    // Color coding: green = subsonic, orange = transonic, red = supersonic warning.
+    // Transonic (M 0.8–1.2) is the most dangerous structural regime (peak Cd).
+    const M = atmoData.machNumber; // Current Mach number (dimensionless)
+    const machColor =
+      M < 0.8  ? COLORS.text :   // White — subsonic, no concern
+      M < 1.2  ? "#ffaa00" :     // Orange — transonic drag rise, Max-Q region
+      M < 5.0  ? "#ff7722" :     // Dark orange — supersonic
+                 "#ff4444";      // Red — hypersonic, heating critical
+    line(`MACH: ${M.toFixed(2)}`, y, machColor); // e.g., "MACH: 2.45"
+    y += lh; // Advance to next row
+
+    // ── DYNAMIC PRESSURE (Q) ────────────────────────────────────────────────
+    // Q = 0.5 × ρ × v² — the aerodynamic loading on the structure.
+    // Displayed in kPa (kiloPascals) for readability. 1 kPa = 1000 Pa.
+    // Red warning when Q exceeds 80% of the structural limit (33 kPa).
+    const qKPa = atmoData.dynamicPressure / 1000; // Convert Pa to kPa for display
+    const qLimit = 33.0; // kPa — structural pressure limit (33 kPa)
+    const qColor =
+      qKPa > qLimit       ? "#ff3333" :   // Red: structural limit exceeded
+      qKPa > qLimit * 0.8 ? "#ffaa00" :   // Orange: approaching limit (> 26.4 kPa)
+                            COLORS.text;  // White: safe
+    line(`Q: ${qKPa.toFixed(1)} kPa`, y, qColor); // e.g., "Q: 28.5 kPa"
+    y += lh;
+
+    // ── MAX-Q RECORD ────────────────────────────────────────────────────────
+    // Peak dynamic pressure reached so far this flight.
+    // Shown in yellow — it's an important historical milestone in every launch.
+    // Format: "MAX-Q: 33.2 kPa @ 12.4km" (matching SpaceX launch commentary).
+    const maxQKPa = atmoData.maxDynamicPressure / 1000; // Pa → kPa
+    const maxQAltKm = (atmoData.maxQAltitude / 1000).toFixed(1); // m → km
+    const maxQColor = maxQKPa > qLimit ? "#ff8844" : "#ffdd44"; // Orange if over limit, yellow if safe
+    line(
+      maxQKPa > 0 // Only show if Max-Q has been recorded
+        ? `MAX-Q: ${maxQKPa.toFixed(1)} kPa @${maxQAltKm}km` // Show peak Q with altitude
+        : `MAX-Q: --`, // Not yet reached
+      y,
+      maxQColor // Yellow or orange depending on severity
+    );
+    y += lh;
+
+    // ── G-FORCE ─────────────────────────────────────────────────────────────
+    // Current acceleration in multiples of standard gravity (9.81 m/s²).
+    // 1 G = standing on Earth. 3 G = aggressive fighter turn. 7 G = structural limit.
+    // Color: green < 3G (comfortable), orange 3–6G (high), red > 6G (near structural limit).
+    const G = atmoData.currentGForce; // Current G-force
+    const gColor =
+      G > 7.0 ? "#ff3333" :  // Red: exceeding structural G limit
+      G > 5.0 ? "#ffaa00" :  // Orange: high G, approaching limit
+      G > 3.0 ? "#ffdd44" :  // Yellow: elevated but manageable
+               COLORS.text;  // White: comfortable range
+    line(`G: ${G.toFixed(1)} G`, y, gColor); // e.g., "G: 3.2 G"
+    y += lh;
+
+    // ── STRUCTURAL INTEGRITY ─────────────────────────────────────────────────
+    // Health of the rocket's structure (0–100%).
+    // Decreases when Q or G limits are exceeded, or when flying at high AoA supersonically.
+    // Green > 70%, orange 30–70%, red < 30% (near breakup).
+    const integrity = atmoData.structuralIntegrity; // %
+    const integrityColor =
+      integrity < 30  ? "#ff3333" : // Red: critical — imminent breakup
+      integrity < 70  ? "#ffaa00" : // Orange: degraded — reduce stress immediately
+                        "#44ff44";  // Green: healthy structure
+    line(`STRUCT: ${integrity.toFixed(0)}%`, y, integrityColor); // e.g., "STRUCT: 98%"
+    y += lh;
+
+    // ── STAGNATION TEMPERATURE ───────────────────────────────────────────────
+    // Nose cone temperature: T_stag = T_ambient × (1 + 0.2 × M²)
+    // Displayed in Kelvin — warmer than ambient even at subsonic speeds.
+    // Critical above 2000 K (nose cone material near melting without heat shield).
+    // Color: white < 500K, orange 500–1500K, red 1500–2000K, bright red > 2000K.
+    const T = atmoData.stagnationTemperature; // K
+    const tempColor =
+      T > 2000 ? "#ff3333" :  // Red: CRITICAL — material failure risk
+      T > 1500 ? "#ff7722" :  // Dark orange: very hot
+      T > 800  ? "#ffaa00" :  // Orange: aerodynamic heating visible
+      T > 400  ? "#ffdd88" :  // Warm yellow: elevated but safe
+               COLORS.text;  // White: near-ambient
+    line(`TEMP: ${T.toFixed(0)} K`, y, tempColor); // e.g., "TEMP: 1240 K"
+    y += lh;
+  }
+
   // ── Time multiplier indicator ──
   const timeStr = isPaused ? "⏸ PAUSED" : timeMultiplier === 1 ? "▶ 1×" : `▶▶ ${timeMultiplier}×`;
   const timeColor = isPaused ? "#ff8844" : timeMultiplier > 1 ? "#ffff44" : "#44ff88";
@@ -833,4 +1049,210 @@ export function drawPerfStats(
   line(`Particles: ${metrics.particleCount}`, y); y += lh;
   line(`Trajectory pts: ${metrics.trajectoryPointCount}`, y); y += lh;
   line(`Health: ${metrics.healthScore.toFixed(0)}/100`, y);
+}
+
+// ─── MAX-Q FLASH ──────────────────────────────────────────────────────────────
+
+/**
+ * Draw the "MAX-Q" callout text centered on the canvas.
+ * Shown for 2 seconds when the rocket passes through its maximum dynamic pressure.
+ *
+ * WHY MAX-Q IS CALLED OUT IN REAL LAUNCHES:
+ *   "Vehicle is passing through Max-Q" is a standard milestone announced in every
+ *   SpaceX, NASA, and ULA launch webcast. It marks the moment of greatest
+ *   aerodynamic stress on the vehicle — the product of high air density (still
+ *   relatively dense atmosphere) and high speed (rocket is accelerating fast).
+ *   After Max-Q, the air thins faster than the rocket speeds up, so structural
+ *   loads decrease. The rocket is "over the hump" and flying into thinner air.
+ *
+ * VISUAL DESIGN:
+ *   Large yellow bold text in the center of the screen.
+ *   Alpha fades from 1.0 (at timer=2s) to 0 (at timer=0s) for a smooth fade-out.
+ *
+ * @param ctx          Canvas 2D context.
+ * @param canvasWidth  Canvas width in pixels.
+ * @param canvasHeight Canvas height in pixels.
+ * @param alpha        Opacity 0–1 (caller fades this out over 2 seconds).
+ */
+export function drawMaxQFlash(
+  ctx: CanvasRenderingContext2D,
+  canvasWidth: number,
+  canvasHeight: number,
+  alpha: number // 0–1, caller reduces this over 2 seconds until it reaches 0
+): void {
+  // Clamp alpha to valid range in case of floating-point drift.
+  const a = Math.max(0, Math.min(1, alpha)); // 0–1
+
+  // Center of the screen where the callout appears.
+  const cx = canvasWidth / 2;  // Horizontal center
+  const cy = canvasHeight / 2 - 40; // Slightly above vertical center (not covering telemetry)
+
+  // ── BACKGROUND BADGE ──────────────────────────────────────────────────────
+  // Dark semi-transparent pill behind the text for legibility against any background.
+  ctx.fillStyle = `rgba(0, 0, 0, ${a * 0.6})`; // Dark background, fades with alpha
+  const badgeW = 300; // Badge width in pixels
+  const badgeH = 60;  // Badge height in pixels
+  ctx.beginPath();
+  ctx.roundRect(cx - badgeW / 2, cy - badgeH / 2, badgeW, badgeH, 8); // Rounded rect
+  ctx.fill(); // Draw dark badge
+
+  // ── "MAX-Q" TEXT ──────────────────────────────────────────────────────────
+  // Large bold yellow text. Yellow is used for callouts in aerospace (warning but not failure).
+  ctx.font = "bold 42px monospace"; // Large, bold, monospace to match HUD style
+  ctx.textAlign = "center"; // Center the text horizontally
+  ctx.textBaseline = "middle"; // Center the text vertically
+
+  // Subtle glow/shadow behind the text for depth.
+  ctx.shadowColor = `rgba(255, 220, 0, ${a * 0.8})`; // Yellow glow
+  ctx.shadowBlur = 12; // Soft glow radius
+
+  ctx.fillStyle = `rgba(255, 220, 0, ${a})`; // Yellow text, fades with alpha
+  ctx.fillText("MAX-Q", cx, cy); // Draw the callout text
+
+  // ── SUBTITLE ─────────────────────────────────────────────────────────────
+  // Small label explaining what Max-Q means — educational context for new players.
+  ctx.font = `12px monospace`; // Smaller subtitle font
+  ctx.fillStyle = `rgba(255, 200, 80, ${a * 0.7})`; // Softer yellow, slightly faded
+  ctx.shadowBlur = 0; // No glow on subtitle
+  ctx.fillText("MAX AERODYNAMIC PRESSURE", cx, cy + 26); // Subtitle below main text
+
+  // ── RESTORE CONTEXT STATE ─────────────────────────────────────────────────
+  // Reset shadow and text alignment so subsequent draw calls are not affected.
+  ctx.shadowBlur = 0; // Clear shadow so it doesn't leak to other elements
+  ctx.textAlign = "left"; // Reset text alignment to default (left)
+  ctx.textBaseline = "alphabetic"; // Reset text baseline to default
+}
+
+// ─── WARNING BANNER ──────────────────────────────────────────────────────────
+
+/**
+ * Draw a red warning banner at the top of the canvas.
+ * Used for engine failure alerts, aerodynamic heating warnings, and structural warnings.
+ *
+ * Shows a red background bar with the warning message in white/yellow text.
+ * Multiple warnings queue and the most recent one is shown.
+ *
+ * @param ctx          Canvas 2D context.
+ * @param canvasWidth  Canvas width in pixels.
+ * @param message      Warning message to display (e.g., "⚠ ENGINE 3 FLAMEOUT").
+ * @param alpha        Opacity 0–1 (caller fades this out as the warning timer counts down).
+ * @param yOffset      Vertical offset for stacking multiple banners (0 = top banner).
+ */
+export function drawWarningBanner(
+  ctx: CanvasRenderingContext2D,
+  canvasWidth: number,
+  message: string,  // The warning text to display
+  alpha: number,    // Opacity: 1=fully visible, 0=invisible
+  yOffset: number = 50 // Y position from top (50px = below the top control bar)
+): void {
+  // Clamp alpha to valid range.
+  const a = Math.max(0, Math.min(1, alpha)); // 0–1
+
+  // ── BACKGROUND BAR ────────────────────────────────────────────────────────
+  // Dark red background bar spanning the full canvas width.
+  // The red color immediately communicates "danger" to the player.
+  ctx.fillStyle = `rgba(180, 10, 10, ${a * 0.85})`; // Dark red, semi-transparent
+  const bannerH = 32; // Banner height in pixels
+  ctx.fillRect(0, yOffset, canvasWidth, bannerH); // Span full width
+
+  // Top and bottom accent lines for a polished look.
+  ctx.fillStyle = `rgba(255, 80, 80, ${a * 0.8})`; // Bright red accent
+  ctx.fillRect(0, yOffset, canvasWidth, 2);         // Top accent line
+  ctx.fillRect(0, yOffset + bannerH - 2, canvasWidth, 2); // Bottom accent line
+
+  // ── WARNING TEXT ──────────────────────────────────────────────────────────
+  // White bold text centered vertically in the banner.
+  ctx.font = "bold 14px monospace"; // Bold monospace matches the HUD style
+  ctx.textAlign = "center"; // Center horizontally
+  ctx.textBaseline = "middle"; // Center vertically
+
+  // Subtle glow for urgency.
+  ctx.shadowColor = `rgba(255, 100, 100, ${a * 0.6})`; // Red glow
+  ctx.shadowBlur = 6; // Soft glow
+
+  ctx.fillStyle = `rgba(255, 240, 240, ${a})`; // Near-white text
+  ctx.fillText(message, canvasWidth / 2, yOffset + bannerH / 2); // Centered text
+
+  // ── RESTORE CONTEXT ───────────────────────────────────────────────────────
+  ctx.shadowBlur = 0;         // Clear shadow to prevent bleeding onto other elements
+  ctx.textAlign = "left";     // Reset alignment
+  ctx.textBaseline = "alphabetic"; // Reset baseline
+}
+
+// ─── STRUCTURAL FAILURE OVERLAY ──────────────────────────────────────────────
+
+/**
+ * Draw the "STRUCTURAL FAILURE" full-screen overlay.
+ * Shown when structural integrity reaches 0% and the rocket breaks apart.
+ *
+ * WHAT STRUCTURAL FAILURE LOOKS LIKE IN REAL LIFE:
+ *   During the 1986 Challenger disaster, aerodynamic forces after an SRB O-ring
+ *   failure caused the external tank to breach and the vehicle broke apart at Max-Q
+ *   (altitude: ~14 km, Mach ~1.9). The vehicle was not destroyed by explosion —
+ *   it broke apart from aerodynamic loads, then the propellants dispersed.
+ *   In more recent history, failures during high-dynamic-pressure flight are rare
+ *   but illustrate why Max-Q management is critical.
+ *
+ * The overlay is drawn on top of everything else on the canvas.
+ * A semi-transparent dark red tint fills the screen with large text.
+ * The player can still hit Reset to try again.
+ *
+ * @param ctx          Canvas 2D context.
+ * @param canvasWidth  Canvas width in pixels.
+ * @param canvasHeight Canvas height in pixels.
+ */
+export function drawStructuralFailureOverlay(
+  ctx: CanvasRenderingContext2D,
+  canvasWidth: number,
+  canvasHeight: number
+): void {
+  // ── DARK RED SCREEN TINT ──────────────────────────────────────────────────
+  // A red-tinted overlay signals catastrophic failure without completely hiding the scene.
+  ctx.fillStyle = "rgba(120, 0, 0, 0.55)"; // Semi-transparent dark red
+  ctx.fillRect(0, 0, canvasWidth, canvasHeight); // Fill entire canvas
+
+  // ── CENTER PANEL ─────────────────────────────────────────────────────────
+  // Dark panel in the center with the failure message.
+  const panelW = 460; // Panel width in pixels
+  const panelH = 150; // Panel height in pixels
+  const panelX = (canvasWidth - panelW) / 2; // Centered horizontally
+  const panelY = (canvasHeight - panelH) / 2; // Centered vertically
+
+  ctx.fillStyle = "rgba(15, 0, 0, 0.92)"; // Very dark red panel background
+  ctx.beginPath();
+  ctx.roundRect(panelX, panelY, panelW, panelH, 8); // Rounded corners
+  ctx.fill(); // Draw panel
+
+  ctx.strokeStyle = "#cc2222"; // Red border
+  ctx.lineWidth = 2;
+  ctx.stroke(); // Draw border
+
+  // ── TITLE TEXT: "STRUCTURAL FAILURE" ─────────────────────────────────────
+  ctx.textAlign = "center"; // Center all text
+  ctx.textBaseline = "middle"; // Vertically centered
+
+  // Glow effect for dramatic emphasis.
+  ctx.shadowColor = "rgba(255, 0, 0, 0.8)"; // Red glow
+  ctx.shadowBlur = 20; // Wide glow
+
+  ctx.font = "bold 28px monospace"; // Large bold font
+  ctx.fillStyle = "#ff3333"; // Bright red text
+  ctx.fillText("STRUCTURAL FAILURE", canvasWidth / 2, panelY + 38); // Title line
+
+  ctx.shadowBlur = 0; // Turn off glow for smaller text
+
+  // ── SUBTITLE: "MAX-Q EXCEEDED — VEHICLE BREAK-UP" ────────────────────────
+  ctx.font = "16px monospace"; // Smaller subtitle
+  ctx.fillStyle = "#ffaaaa"; // Light red/pink text
+  ctx.fillText("MAX-Q EXCEEDED — VEHICLE BREAK-UP", canvasWidth / 2, panelY + 72); // Subtitle
+
+  // ── INSTRUCTION TEXT ─────────────────────────────────────────────────────
+  // Prompt the player to reset and try again with a different flight profile.
+  ctx.font = "13px monospace"; // Smallest text size
+  ctx.fillStyle = "#ff8888"; // Lighter red
+  ctx.fillText("Throttle back earlier or fly more prograde. Press ↺ Reset to try again.", canvasWidth / 2, panelY + 108); // Instruction
+
+  // ── RESTORE CONTEXT ───────────────────────────────────────────────────────
+  ctx.textAlign = "left"; // Reset to default
+  ctx.textBaseline = "alphabetic"; // Reset to default
 }

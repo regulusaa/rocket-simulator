@@ -23,6 +23,13 @@ import type { Vector2D, SimulationConfig } from "./types";
 // Vector2D: {x, y} for positions/velocities/forces.
 // SimulationConfig: gravity, wind, drag, rocketRadius, timeStep.
 
+// Import atmospheric functions for physically-accurate drag calculation.
+// Physical drag replaces the old linear approximation (dragForce = Cd × v).
+// Real drag: F_drag = 0.5 × ρ(altitude) × v² × Cd(Mach) × A
+// where ρ is air density from the ISA model, Cd varies with Mach number,
+// and A is the rocket's cross-sectional area (π × radius²).
+import { getAirDensity, getMachNumber, getDragCoefficient } from "./AtmosphereModel";
+
 import type { MultiStageRocketConfig } from "./MultiStageSystem";
 // The full rocket definition: all stages with their mass/thrust/fuel specs.
 
@@ -287,24 +294,67 @@ export function updatePhysics(
     accelerationY += Math.cos(state.angle) * totalThrust / totalMass;
   }
 
-  // ── AERODYNAMIC DRAG ──
-  // Drag opposes motion and is proportional to speed (simplified linear model).
-  // Real rockets use drag = 0.5 * ρ * v² * Cd * A, but for gameplay the linear
-  // approximation is good enough and avoids needing atmospheric density tables.
+  // ── AERODYNAMIC DRAG (physically accurate) ───────────────────────────────
+  // Real aerodynamic drag formula: F_drag = 0.5 × ρ × v² × Cd × A
+  //
+  //   ρ   = air density at current altitude (kg/m³) — from ISA atmosphere model.
+  //         Decreases exponentially with altitude: ρ ≈ 1.225 × e^(-h/8500).
+  //         At sea level: 1.225 kg/m³. At 10 km: ~0.414. Above 100 km: ~0.
+  //
+  //   v²  = square of the TOTAL speed (not per axis), because drag depends on
+  //         the magnitude of the velocity vector hitting the nose cone.
+  //
+  //   Cd  = drag coefficient — varies with Mach number (NOT constant!).
+  //         Subsonic (M < 0.8):    Cd = 0.3 (clean attached flow)
+  //         Transonic (M 0.8–1.2): Cd up to 0.6 (shock waves form — "sound barrier")
+  //         Supersonic (M > 1.2):  Cd = 0.2 (stable oblique shock)
+  //         Hypersonic (M > 5):    Cd = 0.15 (thin shock layer)
+  //
+  //   A   = cross-sectional area of the rocket (m²) = π × radius²
+  //         Uses simConfig.rocketRadius — the radius of the rocket body.
+  //         A = π × (0.5 m)² ≈ 0.785 m² for a 1-meter-diameter vehicle.
+  //
+  // This model correctly captures:
+  //   • Max-Q around 11–14 km (where ρ is still high and v is large)
+  //   • Transonic drag rise near Mach 1 (highest structural loading)
+  //   • Falling drag at high altitude (thin air, even at hypersonic speed)
 
-  if (state.velocity.x !== 0) {
-    // Horizontal drag force magnitude (N) — scales with horizontal speed.
-    const dragForceX = simConfig.dragCoefficient * Math.abs(state.velocity.x);
-    // Acceleration from drag in X — negative sign of velocity means it opposes motion.
-    // Math.sign() returns +1 or -1 based on velocity direction.
-    accelerationX -= (dragForceX / totalMass) * Math.sign(state.velocity.x);
-  }
+  // Compute total velocity magnitude (speed) in m/s.
+  // Speed = √(vx² + vy²) — the actual length of the velocity vector.
+  const velocityMagnitude = Math.sqrt(
+    state.velocity.x * state.velocity.x + // Horizontal component squared
+    state.velocity.y * state.velocity.y   // Vertical component squared
+  ); // m/s — total speed
 
-  if (state.velocity.y !== 0) {
-    // Vertical drag force magnitude — scales with vertical speed.
-    const dragForceY = simConfig.dragCoefficient * Math.abs(state.velocity.y);
-    // Vertical drag opposes vertical motion direction.
-    accelerationY -= (dragForceY / totalMass) * Math.sign(state.velocity.y);
+  if (velocityMagnitude > 0) {
+    // Compute atmospheric air density at the rocket's current altitude.
+    // Density decreases with altitude so drag is much higher at low altitude.
+    const airDensity = getAirDensity(state.position.y); // kg/m³
+
+    // Compute Mach number to look up the correct drag coefficient.
+    // Mach = speed / local_speed_of_sound — the speed of sound decreases with temperature.
+    const mach = getMachNumber(velocityMagnitude, state.position.y); // dimensionless
+
+    // Mach-dependent drag coefficient — peaks at transonic, lower supersonic/hypersonic.
+    const cd = getDragCoefficient(mach); // dimensionless Cd
+
+    // Cross-sectional area of the rocket nose cone facing the airstream.
+    // A = π × r² where r = simConfig.rocketRadius (meters).
+    const crossSectionArea = Math.PI * simConfig.rocketRadius * simConfig.rocketRadius; // m²
+
+    // Total drag force magnitude: F_drag = 0.5 × ρ × v² × Cd × A (Newton)
+    // This is the force the airstream exerts on the rocket opposing its motion.
+    const dragForceMagnitude =
+      0.5 * airDensity * velocityMagnitude * velocityMagnitude * cd * crossSectionArea; // N
+
+    // Convert force to acceleration: a = F/m (Newton's 2nd law).
+    const dragAccelMagnitude = dragForceMagnitude / totalMass; // m/s²
+
+    // Decompose drag acceleration into X and Y components along the velocity direction.
+    // Drag always opposes the velocity vector: direction = -(velocity / speed).
+    // vx/speed = unit vector component in X, so drag_x = −(drag_accel × vx/speed).
+    accelerationX -= dragAccelMagnitude * (state.velocity.x / velocityMagnitude); // m/s²
+    accelerationY -= dragAccelMagnitude * (state.velocity.y / velocityMagnitude); // m/s²
   }
 
   // ── WIND ──

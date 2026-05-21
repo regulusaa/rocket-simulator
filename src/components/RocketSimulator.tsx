@@ -89,8 +89,37 @@ import {
   drawRocket,
   drawTelemetry,
   drawPerfStats,
+  drawMaxQFlash,
+  drawWarningBanner,
+  drawStructuralFailureOverlay,
   type Star,
+  type AtmosphericTelemetry, // NEW: data bundle passed to telemetry and rocket draw functions
 } from "../utils/drawHelpers";
+// drawMaxQFlash: large yellow "MAX-Q" callout shown for 2 seconds at peak dynamic pressure.
+// drawWarningBanner: red top-of-screen banner for engine failure and heating warnings.
+// drawStructuralFailureOverlay: full-screen red overlay when structural integrity hits 0%.
+// AtmosphericTelemetry: interface bundling Mach, Q, Max-Q, G-force, integrity, stagnation temp.
+
+// Import the three new physics systems.
+import {
+  getMachNumber,     // Mach = speed / local_speed_of_sound — needed for heating and drag telemetry
+  getDynamicPressure, // Q = 0.5 × ρ × v² — primary structural load, drives Max-Q callout
+  getTemperature,    // ISA temperature at altitude — used for stagnation temp calculation
+} from "../physics/AtmosphereModel";
+
+import {
+  createStructuralState,    // Factory: fresh 100% integrity state for a new flight
+  updateStructuralLimits,   // Per-frame: degrade integrity based on Q, G, and AoA stress
+  type StructuralState,     // TypeScript interface for the structural health bundle
+} from "../physics/StructuralLimits";
+
+import {
+  createEngineFailureState, // Factory: failure state initialized to chosen difficulty
+  updateEngineFailures,     // Per-frame: probabilistic failure checks, applies to config
+  resetEngineFailures,      // Clears failure history for reset/rocket-change
+  type EngineFailureState,  // TypeScript interface for failure tracking
+  type DifficultyLevel,     // "safe" | "normal" | "realistic" | "chaos"
+} from "../physics/EngineFailureSystem";
 
 // Import Monte Carlo simulation engine and supporting types.
 // runMonteCarloSimulation: async runner that yields between runs to keep UI responsive.
@@ -220,6 +249,48 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   const landingStateRef = useRef<LandingState>(createLandingState());          // Landing outcome
   const parachuteDeployedRef = useRef<boolean>(false); // Edge-trigger: only deploy once per flight
 
+  // ── ATMOSPHERIC & STRUCTURAL PHYSICS REFS ────────────────────────────────
+  // These refs are read/written inside the game loop (not React state) so the
+  // loop always sees the latest value without re-render overhead.
+
+  // Structural health of the rocket — integrity degrades under Q, G, and AoA stress.
+  const structuralStateRef = useRef<StructuralState>(createStructuralState());
+
+  // Engine failure tracking — probabilistic failures based on difficulty.
+  const engineFailureStateRef = useRef<EngineFailureState>(createEngineFailureState("normal"));
+
+  // Latest computed atmospheric/structural telemetry bundle, updated every frame.
+  // Written in the game loop and passed to drawTelemetry() and drawRocket() each frame.
+  const currentAtmoDataRef = useRef<AtmosphericTelemetry>({
+    machNumber: 0,           // Mach number (0 at rest on pad)
+    dynamicPressure: 0,      // Q in Pa (0 on pad)
+    maxDynamicPressure: 0,   // Max Q reached so far (0 at start)
+    maxQAltitude: 0,         // Altitude of Max-Q event (0 = not yet reached)
+    currentGForce: 0,        // G-force (1G at rest due to gravity)
+    structuralIntegrity: 100, // Start at 100% integrity
+    stagnationTemperature: 288, // ~ambient sea-level temperature at rest
+  });
+
+  // Previous frame's dynamic pressure — used to detect when Q peaks (Max-Q passage).
+  // When current Q < prevQ after having been non-trivially high, Max-Q has passed.
+  const prevDynamicPressureRef = useRef<number>(0); // Pa — last frame's Q
+
+  // Whether Max-Q passage has been detected this flight (one-shot flag).
+  // Prevents multiple Max-Q callouts per flight (Q can temporarily dip and rise again).
+  const maxQPassedRef = useRef<boolean>(false); // true = callout already shown
+
+  // Countdown timer for the Max-Q "MAX-Q" flash overlay (seconds remaining).
+  // Set to 2.0 when Max-Q is detected; decremented by rawDelta each frame until 0.
+  const maxQFlashTimerRef = useRef<number>(0); // s — 0 = not showing, > 0 = fading
+
+  // Active warning banners (engine failure, heating, etc.).
+  // Each entry: { message: string, timeLeft: number } — timeLeft counts down to 0.
+  const warningBannersRef = useRef<Array<{ message: string; timeLeft: number }>>([]);
+
+  // True once structural integrity hits 0% — renders the structural failure overlay.
+  // Latches true and stays true until the player resets.
+  const isStructuralFailureRef = useRef<boolean>(false);
+
   // ── AUDIO TRACKING REFS ────────────────────────────────────────────────────
   // Track throttle and engine sound state to trigger sounds at the right moments.
   const previousThrottleRef    = useRef<number>(0);   // Last frame's throttle (for change detection)
@@ -304,6 +375,11 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   // We store a copy (not a ref to the buffer) so it persists after the buffer is cleared on reset.
   const playerTrajectoryRef = useRef<Array<{ x: number; y: number }>>([]);
 
+  // Difficulty setting for engine failure probability (controls EngineFailureSystem).
+  // Stored in React state so the top-bar selector re-renders on change.
+  // The game loop reads from engineFailureStateRef.current.difficulty (kept in sync below).
+  const [difficulty, setDifficulty] = useState<DifficultyLevel>("normal");
+
   // Audio UI state.
   const [audioMuted,   setAudioMuted]   = useState<boolean>(false);
   const [masterVolume, setMasterVolume] = useState<number>(0.5);
@@ -332,6 +408,14 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   useEffect(() => {
     showPerfStatsRef.current = showPerfStats;
   }, [showPerfStats]);
+
+  // Sync difficulty React state → engineFailureStateRef so the game loop always
+  // reads the latest difficulty without being in the loop's dependency array.
+  // This also updates the .difficulty field on the existing failure state object
+  // so in-flight difficulty changes take effect immediately (useful for demos).
+  useEffect(() => {
+    engineFailureStateRef.current.difficulty = difficulty; // Apply immediately to live state
+  }, [difficulty]); // Re-run whenever the player changes the difficulty selector
 
   // ── WINDOW RESIZE ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -476,13 +560,156 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           {
             gravity:           GRAVITY,           // 9.81 m/s²
             windSpeed:         WIND_SPEED,         // {x: 3, y: 0} light breeze
-            dragCoefficient:   DRAG_COEFFICIENT,   // 0.1
-            rocketRadius:      ROCKET_RADIUS,       // 0.5 m
+            dragCoefficient:   DRAG_COEFFICIENT,   // Legacy field — new drag uses AtmosphereModel
+            rocketRadius:      ROCKET_RADIUS,       // 0.5 m cross-section radius
             timeStep:          PHYSICS_TICK_RATE,   // 60 Hz target rate
           },
           subDelta
         );
         performanceMonitorRef.current.endPhysicsTimer();
+
+        // ── ATMOSPHERIC DATA COMPUTATION ─────────────────────────────────
+        // Compute all altitude-dependent quantities used by the new systems.
+        // These are computed every sub-step so structural/failure checks see current values.
+
+        // Total velocity magnitude (speed) in m/s — √(vx²+vy²).
+        // Mach and dynamic pressure both need scalar speed, not the vector components.
+        const velMag = Math.sqrt(
+          frame.state.velocity.x * frame.state.velocity.x + // Horizontal speed component squared
+          frame.state.velocity.y * frame.state.velocity.y   // Vertical speed component squared
+        ); // m/s — current total speed of the rocket
+
+        // Mach number at current speed and altitude.
+        // Mach = speed / local_speed_of_sound. Depends on altitude because temperature changes.
+        const currentMach = getMachNumber(velMag, frame.state.position.y); // dimensionless
+
+        // Dynamic pressure Q = 0.5 × ρ × v² — the primary aerodynamic structural load.
+        // This is what "Max-Q" refers to: the single highest Q during the entire flight.
+        const currentQ = getDynamicPressure(velMag, frame.state.position.y); // Pa
+
+        // Ambient temperature at this altitude from the ISA model.
+        // Used in the stagnation temperature formula below.
+        const ambientTemp = getTemperature(frame.state.position.y); // K
+
+        // Stagnation temperature: how hot the nose cone gets from aerodynamic compression.
+        // Formula: T_stag = T_ambient × (1 + 0.2 × M²)
+        // This is the adiabatic stagnation temperature (isentropic flow assumption).
+        // At M=3 and T=220K (stratosphere): T_stag = 220 × (1 + 1.8) = 616 K
+        // At M=5 and T=220K: T_stag = 220 × (1 + 5.0) = 1320 K — orange glow territory
+        const stagnationTemp = ambientTemp * (1 + 0.2 * currentMach * currentMach); // K
+
+        // ── ENGINE FAILURE CHECK (only on first sub-step to avoid double-triggering) ──
+        // Failures are probabilistic events; checking once per frame is sufficient.
+        // Checking on every sub-step would artificially inflate failure probability at 10× speed.
+        if (step === 0 && frame.state.isFlying) {
+          // Run one frame of failure checks — may modify config (shut down engines etc.).
+          const newFailures = updateEngineFailures(
+            engineFailureStateRef.current, // Failure state (mutated to record new failures)
+            config,                         // Rocket config (mutated to apply failures to stages)
+            subDelta,                       // Time step for probability calculation
+            frame.state.timeElapsed         // Flight time for failure event timestamps
+          );
+
+          // For each failure that occurred this frame: add warning banner and play beep.
+          for (const failure of newFailures) {
+            // Add a 4-second warning banner entry — will be drawn each frame until timeLeft = 0.
+            warningBannersRef.current.push({
+              message: failure.message, // e.g., "⚠ ENGINE 1 FLAMEOUT — THRUST REDUCED"
+              timeLeft: 4.0,            // s — banner persists 4 seconds then fades
+            });
+            // Play the warning beep sound to alert the player audibly.
+            audioManagerRef.current.playSound("warning-beep"); // Audible failure alert
+          }
+        }
+
+        // ── STRUCTURAL LIMITS UPDATE ──────────────────────────────────────
+        // Check if current Q, G-force, or angle of attack is degrading the structure.
+        // Only run during flight — no structural stress sitting on the pad.
+        if (frame.state.isFlying && !isStructuralFailureRef.current) {
+          // Total acceleration magnitude = √(ax²+ay²) — used for G-force calculation.
+          const accelMag = Math.sqrt(
+            frame.state.acceleration.x * frame.state.acceleration.x + // Ax squared
+            frame.state.acceleration.y * frame.state.acceleration.y   // Ay squared
+          ); // m/s²
+
+          // Update structural integrity and get breakup flag.
+          const brokeApart = updateStructuralLimits(
+            structuralStateRef.current, // Structural state (mutated: Q, G, integrity)
+            velMag,                     // m/s — total speed for dynamic pressure
+            frame.state.position.y,     // m — altitude for air density lookup
+            accelMag,                   // m/s² — for G-force calculation
+            frame.state.angle,          // rad — tilt angle for AoA check
+            currentMach,                // dimensionless — for supersonic AoA damage scaling
+            frame.state.timeElapsed,    // s — flight time for Max-Q timestamp
+            subDelta                    // s — time step for damage rate integration
+          );
+
+          // Handle catastrophic structural failure (integrity hit 0%).
+          if (brokeApart) {
+            isStructuralFailureRef.current = true; // Latch the failure flag permanently
+
+            // Force the rocket into a "landed" state to stop physics simulation.
+            frame.state.hasLanded = true; // Mark as having "touched down" (ends physics)
+            frame.state.isFlying = false;  // Clear flying flag
+
+            // Big warning banner — structural failure is catastrophic.
+            warningBannersRef.current.push({
+              message: "⚠ STRUCTURAL FAILURE — MAX-Q EXCEEDED — VEHICLE BREAK-UP",
+              timeLeft: 10.0, // s — show this banner for a full 10 seconds
+            });
+            // Play hard landing (crash) sound as a proxy for breakup sound.
+            audioManagerRef.current.playSound("landing-hard"); // Closest available sound
+            audioManagerRef.current.stopSound("engine-thrust"); // Stop engine roar
+            engineSoundPlayingRef.current = false; // Mark engine sound as stopped
+          }
+
+          // ── AERODYNAMIC HEATING WARNING ───────────────────────────────────
+          // If stagnation temperature exceeds 2000 K (material failure threshold),
+          // add a warning banner. Only add it once per second to avoid spamming.
+          if (stagnationTemp > 2000 && step === 0) {
+            // Check if there's already an active heating warning to avoid duplicates.
+            const hasHeatingWarning = warningBannersRef.current.some(
+              (w) => w.message.includes("AERODYNAMIC HEATING") // Look for existing heating banner
+            );
+            if (!hasHeatingWarning) {
+              // Add the heating warning banner — appears at top of screen in red.
+              warningBannersRef.current.push({
+                message: "⚠ AERODYNAMIC HEATING — NOSE CONE TEMPERATURE CRITICAL",
+                timeLeft: 3.0, // s — 3-second warning banner duration
+              });
+            }
+          }
+        }
+
+        // ── MAX-Q PASSAGE DETECTION (first sub-step only) ─────────────────
+        // Detect when the rocket has passed through its peak dynamic pressure.
+        // Max-Q is detected when Q starts falling after having risen above a threshold.
+        // We compare current Q to the previous frame's Q to detect the peak.
+        if (step === 0 && frame.state.isFlying && !maxQPassedRef.current) {
+          const prevQ = prevDynamicPressureRef.current; // Previous frame's Q
+
+          // Max-Q passed: Q is now falling (< previous frame), was above 5 kPa (meaningful),
+          // and hasn't been called out yet this flight.
+          if (currentQ < prevQ && prevQ > 5000) {
+            maxQPassedRef.current = true;        // Mark Max-Q as passed for this flight
+            maxQFlashTimerRef.current = 2.0;     // Start 2-second "MAX-Q" flash display
+          }
+          prevDynamicPressureRef.current = currentQ; // Remember Q for next frame comparison
+        }
+
+        // ── UPDATE ATMOSPHERIC TELEMETRY BUNDLE ───────────────────────────
+        // Write the latest computed values into the bundle ref so the render
+        // section (outside the sub-step loop) can pass them to drawTelemetry.
+        // We update on every sub-step so the display is always current.
+        currentAtmoDataRef.current = {
+          machNumber:           currentMach,  // Current Mach number
+          dynamicPressure:      currentQ,     // Current Q in Pa
+          maxDynamicPressure:   structuralStateRef.current.maxDynamicPressure, // Peak Q Pa
+          maxQAltitude:         structuralStateRef.current.maxQAltitude,       // Peak Q altitude
+          currentGForce:        structuralStateRef.current.currentAccelerationG, // G-force
+          structuralIntegrity:  structuralStateRef.current.structuralIntegrity,  // %
+          stagnationTemperature: stagnationTemp, // K — nose cone temperature
+        };
 
         // ── AUDIO: ENGINE SOUNDS (only on first sub-step to avoid sound spam) ──
         if (step === 0) {
@@ -616,6 +843,21 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       // Particles are visual — they should always fade at wall-clock speed.
       particleSystemRef.current.update(rawDelta);
 
+      // ── WARNING BANNER TIMER DECAY (real time) ──────────────────────────
+      // Decrement each warning banner's remaining display time by the wall-clock delta.
+      // We use rawDelta (real seconds) not gameDelta so banners always fade at the
+      // same real-world speed regardless of the time multiplier the player has set.
+      warningBannersRef.current = warningBannersRef.current
+        .map((w) => ({ ...w, timeLeft: w.timeLeft - rawDelta })) // Decrement each banner's timer
+        .filter((w) => w.timeLeft > 0); // Remove banners whose timers have expired
+
+      // ── MAX-Q FLASH TIMER DECAY (real time) ─────────────────────────────
+      // Count down the Max-Q flash overlay timer toward 0.
+      // When it reaches 0 the flash stops rendering (drawMaxQFlash is not called).
+      if (maxQFlashTimerRef.current > 0) {
+        maxQFlashTimerRef.current -= rawDelta; // Decrement at wall-clock speed
+      }
+
       // ── CAMERA UPDATE ──────────────────────────────────────────────────
       const state = flightStateRef.current;
       const camera = cameraRef.current;
@@ -672,17 +914,51 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         : (selectedGoalRef.current?.name ?? "");
       if (goalAlt > 0) drawGoalLine(ctx, cw, ch, camera, goalAlt, goalName);
 
-      // 6. Rocket body (camera-transformed, angle-rotated, detailed visual).
+      // 6. Rocket body with aerodynamic heating glow at high Mach numbers.
+      // Pass currentMach from the latest atmospheric data so the glow renders
+      // at the correct intensity — orange at Mach 3, white-hot at Mach 5+.
       drawRocket(
         ctx, cw, ch, camera, state,
         rocketConfigRef.current,
         parachuteRef.current,
-        landingGearRef.current
+        landingGearRef.current,
+        currentAtmoDataRef.current.machNumber // NEW: Mach number for heating glow
       );
 
-      // 7. Telemetry HUD (bottom-right canvas overlay).
+      // 7. Extended telemetry HUD with atmospheric and structural readings.
+      // Passes the full AtmosphericTelemetry bundle so the panel shows MACH, Q,
+      // MAX-Q, G-force, structural integrity %, and stagnation temperature.
       const activeMult = isPausedRef.current ? 0 : timeMultiplierRef.current;
-      drawTelemetry(ctx, cw, ch, state, rocketConfigRef.current, activeMult, isPausedRef.current);
+      drawTelemetry(
+        ctx, cw, ch, state, rocketConfigRef.current,
+        activeMult, isPausedRef.current,
+        currentAtmoDataRef.current // NEW: atmospheric/structural telemetry bundle
+      );
+
+      // 8. Max-Q flash overlay — shown for 2 seconds after peak dynamic pressure.
+      // Alpha is clamped to 1.0 at the start of the timer and fades as it counts down.
+      // Only drawn while the timer is positive (i.e., while the flash is active).
+      if (maxQFlashTimerRef.current > 0) {
+        const flashAlpha = Math.min(1.0, maxQFlashTimerRef.current); // Fade as timer → 0
+        drawMaxQFlash(ctx, cw, ch, flashAlpha); // Draw the "MAX-Q" callout text
+      }
+
+      // 9. Warning banners — stack from top, most recent shown first.
+      // Each banner has its own alpha derived from its remaining display time.
+      // We show up to 3 banners simultaneously (stacked 34px apart vertically).
+      const visibleBanners = warningBannersRef.current.slice(-3); // Show up to 3 most recent
+      visibleBanners.forEach((banner, idx) => {
+        // Alpha: fully opaque until last 1 second, then fades out.
+        const bannerAlpha = Math.min(1.0, banner.timeLeft); // 0–1 opacity
+        const yOffset = 50 + idx * 34; // Stack banners 34px apart, below top control bar
+        drawWarningBanner(ctx, cw, banner.message, bannerAlpha, yOffset);
+      });
+
+      // 10. Structural failure overlay — shown when integrity reaches 0%.
+      // Drawn on top of everything once latched (persists until Reset).
+      if (isStructuralFailureRef.current) {
+        drawStructuralFailureOverlay(ctx, cw, ch); // Red overlay with failure message
+      }
 
       // 8. Debug performance panel (top-left, toggle with P key).
       if (showPerfStatsRef.current) {
@@ -778,6 +1054,36 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
     performanceMonitorRef.current.reset();
     setShowFullscreenTrajectory(false);
 
+    // ── RESET NEW PHYSICS SYSTEMS ─────────────────────────────────────────
+    // Clear structural state — fresh 100% integrity for the new flight.
+    structuralStateRef.current = createStructuralState(); // New structural state
+
+    // Clear engine failures — reset history, stuck throttles, pump failures.
+    // Preserves the current difficulty setting the player selected.
+    resetEngineFailures(engineFailureStateRef.current); // Clears failure history
+
+    // Reset atmospheric telemetry bundle to ground-level defaults.
+    currentAtmoDataRef.current = {
+      machNumber: 0,            // Mach 0 on the pad
+      dynamicPressure: 0,       // Q = 0 on the pad
+      maxDynamicPressure: 0,    // No Max-Q recorded yet
+      maxQAltitude: 0,          // No Max-Q altitude recorded
+      currentGForce: 0,         // No G-force at rest
+      structuralIntegrity: 100, // Full integrity
+      stagnationTemperature: 288, // ~sea-level ambient temperature
+    };
+
+    // Reset Max-Q tracking.
+    prevDynamicPressureRef.current = 0;  // No previous Q
+    maxQPassedRef.current = false;       // Max-Q not yet detected for new flight
+    maxQFlashTimerRef.current = 0;       // Clear any active flash timer
+
+    // Clear all warning banners from previous flight.
+    warningBannersRef.current = []; // Empty banner queue
+
+    // Clear structural failure latch — rocket is intact for the new flight.
+    isStructuralFailureRef.current = false; // No structural failure
+
     // Cancel any in-progress Monte Carlo simulation so it doesn't call setState
     // on an unmounted or reset component. Then clear all MC UI state.
     mcCancelRef.current?.();              // Abort the async simulation loop
@@ -844,6 +1150,21 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
     engineSoundPlayingRef.current = false;
 
     performanceMonitorRef.current.reset();
+
+    // ── RESET NEW PHYSICS SYSTEMS on rocket change ──────────────────────
+    // A different rocket type means a clean new flight — reset all new systems.
+    structuralStateRef.current = createStructuralState(); // Fresh structure
+    resetEngineFailures(engineFailureStateRef.current);   // Clear failure history
+    currentAtmoDataRef.current = { // Reset atmospheric bundle to ground defaults
+      machNumber: 0, dynamicPressure: 0, maxDynamicPressure: 0,
+      maxQAltitude: 0, currentGForce: 0, structuralIntegrity: 100,
+      stagnationTemperature: 288,
+    };
+    prevDynamicPressureRef.current = 0;  // No previous Q
+    maxQPassedRef.current = false;       // Max-Q detection reset
+    maxQFlashTimerRef.current = 0;       // Clear flash timer
+    warningBannersRef.current = [];      // Clear all warning banners
+    isStructuralFailureRef.current = false; // Clear structural failure flag
   }, []);
 
   /** Handle goal selector change. */
@@ -1008,6 +1329,23 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           />
         </div>
 
+        {/* Difficulty selector — controls engine failure probability */}
+        {/* "safe"=no failures, "normal"=30% base, "realistic"=full, "chaos"=10× */}
+        <div style={controlGroupStyle}>
+          <span>Failures:</span>
+          <select
+            value={difficulty} // Controlled by React state
+            onChange={(e) => setDifficulty(e.target.value as DifficultyLevel)} // Update state on change
+            style={selectStyle}
+            title="Engine failure probability: Safe=none, Normal=30%, Realistic=full, Chaos=10×"
+          >
+            <option value="safe">Safe (no failures)</option>
+            <option value="normal">Normal (30%)</option>
+            <option value="realistic">Realistic</option>
+            <option value="chaos">Chaos (10×)</option>
+          </select>
+        </div>
+
         {/* Reset button */}
         <button onClick={handleReset} style={btnStyle(false)}>
           ↺ Reset
@@ -1079,9 +1417,9 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           <span style={{ fontSize: "11px" }}>{Math.round(masterVolume * 100)}%</span>
         </div>
 
-        {/* Key hint */}
+        {/* Key hint — updated to mention Max-Q and failure difficulty */}
         <div style={{ marginLeft: "auto", fontSize: "11px", opacity: 0.6 }}>
-          SPACE=thrust · A/D=steer · 0-4=speed · P=perf · M=mute
+          SPACE=thrust · A/D=steer · 0-4=speed · P=perf · M=mute · Watch MAX-Q!
         </div>
       </div>
 
