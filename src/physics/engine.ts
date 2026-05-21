@@ -1,24 +1,31 @@
 /**
- * ROCKET SIMULATOR - PHYSICS ENGINE (MULTI-STAGE VERSION)
- * =======================================================
- * Updated physics engine that works with multi-stage rockets instead of single-stage.
- * 
- * Key differences from single-stage version:
- * - Uses MultiStageRocketConfig instead of RocketState for configuration
- * - Calculates thrust and mass from all active stages
- * - Handles fuel consumption across all stages
- * - Performs automatic staging when stages run out of fuel
- * - Tracks which stage is currently active
- * 
- * The physics calculations remain the same (F=ma, kinematics, etc.),
- * but now we sum forces and mass across multiple stages.
+ * ROCKET SIMULATOR - PHYSICS ENGINE (MULTI-STAGE + ROTATION VERSION)
+ * ===================================================================
+ * Core physics simulation: forces, kinematics, staging, and angular motion.
+ *
+ * NEW IN THIS VERSION:
+ *   - angle / angularVelocity fields on MultiStageRocketState
+ *   - Thrust is applied in the direction the rocket is POINTING (not always up)
+ *   - Angular damping keeps the rocket from spinning forever
+ *   - Restoring force returns the rocket toward vertical when not steered
+ *   - applyControls() now accepts tiltLeft/tiltRight and deltaTime for steering
+ *
+ * PHYSICS OVERVIEW (every frame):
+ *   1. Check automatic staging (empty fuel tank → separate stage → ignite next)
+ *   2. Sum forces: gravity (always down) + thrust (along rocket angle) + drag
+ *   3. Integrate: acceleration → velocity → position  (Euler method, Δt per frame)
+ *   4. Consume fuel from active stages
+ *   5. Update angle via angular velocity + damping
+ *   6. Clamp angle, detect ground collision, track metrics
  */
 
-import type {
-  Vector2D,
-  SimulationConfig,
-} from "./types";
+import type { Vector2D, SimulationConfig } from "./types";
+// Vector2D: {x, y} for positions/velocities/forces.
+// SimulationConfig: gravity, wind, drag, rocketRadius, timeStep.
+
 import type { MultiStageRocketConfig } from "./MultiStageSystem";
+// The full rocket definition: all stages with their mass/thrust/fuel specs.
+
 import {
   calculateTotalMass,
   calculateTotalThrust,
@@ -27,134 +34,192 @@ import {
   consumeFuel,
   resetAllStages,
 } from "./MultiStageSystem";
+// Import all multi-stage helper functions so this file only handles high-level physics.
+
+import {
+  ANGULAR_THRUST_RATE,
+  ANGULAR_DAMPING,
+  MAX_TILT_ANGLE,
+  ANGULAR_RESTORE_RATE,
+} from "../utils/constants";
+// Angular control constants extracted to constants.ts for easy tuning.
+
+// ─── STATE TYPE ───────────────────────────────────────────────────────────────
 
 /**
- * State for a multi-stage rocket during flight.
- * This is similar to RocketState but adapted for multi-stage rockets.
- * 
- * The key difference: instead of storing fuel/mass/thrust in one state object,
- * we store them in the MultiStageRocketConfig (which contains all stages),
- * and this state object tracks position, velocity, and flight metrics.
+ * Complete flight state for a multi-stage rocket at a single instant in time.
+ *
+ * COORDINATE SYSTEM:
+ *   position.x — meters east of launch pad (positive = right)
+ *   position.y — meters altitude above ground (positive = up)
+ *   velocity / acceleration follow the same axes
+ *
+ * ANGLE SYSTEM:
+ *   angle = 0             → rocket is perfectly vertical (straight up)
+ *   angle = +π/6 (30°)   → rocket tilted 30° to the right (nose upper-right)
+ *   angle = -π/6 (−30°)  → rocket tilted 30° to the left (nose upper-left)
+ *   Maximum tilt is clamped to ±MAX_TILT_ANGLE (60°) from vertical.
+ *
+ * THRUST VECTOR:
+ *   thrustX = sin(angle) * totalThrust   — horizontal component (0 when vertical)
+ *   thrustY = cos(angle) * totalThrust   — vertical component  (max when vertical)
  */
 export interface MultiStageRocketState {
-  // === POSITION AND MOVEMENT ===
-  // Where the rocket is in 3D space
-  position: Vector2D; // (x, y) in meters
-  velocity: Vector2D; // (vx, vy) in m/s
-  acceleration: Vector2D; // (ax, ay) in m/s²
+  // ── POSITION & MOTION ──
+  position: Vector2D;     // Where the rocket is (meters: x=horizontal, y=altitude)
+  velocity: Vector2D;     // How fast it's moving (m/s: vx=sideways, vy=up/down)
+  acceleration: Vector2D; // Current net acceleration (m/s²) — updated each frame
 
-  // === FLIGHT STATE ===
-  // Is the rocket actively flying (off the ground)?
-  isFlying: boolean;
+  // ── ROTATION ──
+  /**
+   * Current tilt angle in radians measured from vertical.
+   *   0   = straight up
+   *   +   = tilted right (D key / right arrow)
+   *   -   = tilted left  (A key / left arrow)
+   * Clamped to [-MAX_TILT_ANGLE, +MAX_TILT_ANGLE].
+   */
+  angle: number;
 
-  // Has the rocket landed/crashed?
-  hasLanded: boolean;
+  /**
+   * Current angular velocity in radians per second.
+   * Positive = rotating clockwise (tilting right).
+   * Negative = rotating counter-clockwise (tilting left).
+   * Subject to ANGULAR_DAMPING each frame so it doesn't spin forever.
+   */
+  angularVelocity: number;
 
-  // How fast was it moving when it landed?
-  landingVelocity: number; // m/s (negative = downward)
+  // ── FLIGHT STATUS ──
+  isFlying: boolean;      // True once rocket rises above MIN_FLYING_ALTITUDE
+  hasLanded: boolean;     // True once rocket returns to ground after flying
+  landingVelocity: number;// Vertical speed at ground impact (m/s, negative = downward)
 
-  // === METRICS ===
-  // Highest altitude reached so far
-  maxAltitudeReached: number; // meters
-
-  // Total time since launch
-  timeElapsed: number; // seconds
-
-  // Which stage is currently active (burning fuel)?
-  // 0 = first stage, 1 = second stage, etc.
-  activeStageNumber: number;
-
-  // Total number of stages that have separated so far
-  stageSeparationCount: number;
-
-  // Did a stage separate this frame? (for visual effects)
-  didStageSeperateThisFrame: boolean;
+  // ── METRICS ──
+  maxAltitudeReached: number;    // Peak altitude recorded (meters)
+  timeElapsed: number;           // Total simulation time since launch (seconds)
+  activeStageNumber: number;     // Index (0-based) of the currently burning stage
+  stageSeparationCount: number;  // Total number of stage separations performed
+  didStageSeperateThisFrame: boolean; // True only during the frame a separation occurs
 }
+
+// ─── FRAME RESULT ─────────────────────────────────────────────────────────────
 
 /**
- * Create initial multi-stage rocket state.
- * Sets up all the position/velocity/flight data for a new launch.
- * 
- * @param config - The multi-stage rocket configuration
- * @returns Initialized flight state
+ * What the physics engine returns after processing one time step.
+ * The caller uses groundImpact to trigger landing effects/sounds.
  */
 export interface MultiStagePhysicsFrame {
-  state: MultiStageRocketState;
-  deltaTime: number;
-  groundImpact: boolean;
+  state: MultiStageRocketState; // Updated flight state after this time step
+  deltaTime: number;            // The Δt that was used for this integration step (seconds)
+  groundImpact: boolean;        // True if the rocket hit the ground THIS frame (edge-trigger)
 }
 
+// ─── FACTORY ──────────────────────────────────────────────────────────────────
+
+/**
+ * Build the initial flight state for a brand-new launch.
+ * Everything starts at rest on the ground (position y=0, velocity=0, no rotation).
+ *
+ * @param _config — The rocket config (not used yet but kept for future per-rocket state init).
+ * @returns        Fresh MultiStageRocketState ready for the first physics frame.
+ */
 export function createMultiStageRocket(
   _config: MultiStageRocketConfig
 ): MultiStageRocketState {
   return {
-    // === POSITION AND MOVEMENT ===
-    // Start on the ground, centered horizontally
-    position: { x: 0, y: 0 },
-    // No initial motion
-    velocity: { x: 0, y: 0 },
-    // No acceleration yet (gravity will be applied in update)
-    acceleration: { x: 0, y: 0 },
+    // ── POSITION & MOTION — all zero: rocket sits still on the pad ──
+    position: { x: 0, y: 0 },      // Ground level, centered horizontally
+    velocity: { x: 0, y: 0 },      // Stationary
+    acceleration: { x: 0, y: 0 },  // No forces until engine fires
 
-    // === FLIGHT STATE ===
-    // Rocket hasn't launched yet
-    isFlying: false,
-    // Rocket hasn't landed
-    hasLanded: false,
-    // No landing velocity yet
-    landingVelocity: 0,
+    // ── ROTATION — starts perfectly vertical ──
+    angle: 0,           // 0 radians = straight up
+    angularVelocity: 0, // Not rotating
 
-    // === METRICS ===
-    // Max altitude starts at ground level
-    maxAltitudeReached: 0,
-    // No time has passed yet
-    timeElapsed: 0,
-    // First stage (0) is the initial active stage
-    activeStageNumber: 0,
-    // No stages separated yet
-    stageSeparationCount: 0,
-    // No separation this frame
-    didStageSeperateThisFrame: false,
+    // ── FLIGHT STATUS ──
+    isFlying: false,       // Hasn't launched yet
+    hasLanded: false,      // Has not landed (hasn't even launched)
+    landingVelocity: 0,    // No landing velocity yet
+
+    // ── METRICS ──
+    maxAltitudeReached: 0,         // Ground is zero
+    timeElapsed: 0,                // Clock starts at zero
+    activeStageNumber: 0,          // First stage (bottom) is active at launch
+    stageSeparationCount: 0,       // No separations yet
+    didStageSeperateThisFrame: false, // No separation on first frame
   };
 }
 
+// ─── CONTROLS ─────────────────────────────────────────────────────────────────
+
 /**
- * Apply player controls to all stages of the rocket.
- * This is identical to single-stage version but calls the multi-stage throttle function.
- * 
- * @param config - The rocket configuration (contains all stages)
- * @param holdingThrottle - Is player holding spacebar?
- * @param clickThrottle - Did player just click?
- * @param throttleMultiplier - Control responsiveness
+ * Apply player input to the rocket for this frame.
+ * Handles both throttle changes (thrust) and angular steering (tilt).
+ *
+ * Called ONCE per physics sub-step, before updatePhysics().
+ *
+ * @param config          Rocket configuration (stages with throttle state).
+ * @param state           Current flight state (we modify angularVelocity directly).
+ * @param holdingThrottle True while SPACEBAR is held — ramps throttle up.
+ * @param clickThrottle   True for ONE frame when player clicked — pulse burst.
+ * @param tiltLeft        True while A / ArrowLeft is held — rotates rocket left.
+ * @param tiltRight       True while D / ArrowRight is held — rotates rocket right.
+ * @param deltaTime       Seconds since last physics tick — for frame-rate independence.
  */
 export function applyControls(
   config: MultiStageRocketConfig,
+  state: MultiStageRocketState,
   holdingThrottle: boolean,
   clickThrottle: boolean,
-  throttleMultiplier: number = 1
+  tiltLeft: boolean,
+  tiltRight: boolean,
+  deltaTime: number
 ): void {
-  // Call multi-stage throttle function which handles all stages
-  applyMultiStageThrottle(config, holdingThrottle, clickThrottle, throttleMultiplier);
+  // ── THROTTLE ──
+  // Delegate to the multi-stage throttle function which ramps up/down over time.
+  // This is the key fix for "thrust too sensitive": throttle now takes 2s to reach 100%.
+  applyMultiStageThrottle(config, holdingThrottle, clickThrottle, deltaTime);
+
+  // ── STEERING — only allow steering while the rocket is in flight ──
+  // Steering on the ground would just spin the rocket on its launchpad, which looks odd.
+  if (!state.isFlying) return; // Skip angular controls before liftoff
+
+  if (tiltLeft) {
+    // Pressing A / Left Arrow: reduce angular velocity (rotate counter-clockwise = tilt left).
+    // ANGULAR_THRUST_RATE is in rad/s², multiplied by deltaTime gives rad/s change.
+    state.angularVelocity -= ANGULAR_THRUST_RATE * deltaTime;
+  }
+
+  if (tiltRight) {
+    // Pressing D / Right Arrow: increase angular velocity (rotate clockwise = tilt right).
+    state.angularVelocity += ANGULAR_THRUST_RATE * deltaTime;
+  }
 }
 
+// ─── PHYSICS UPDATE ───────────────────────────────────────────────────────────
+
 /**
- * The main physics update function for multi-stage rockets.
- * Called every frame to simulate one time step of rocket flight.
- * 
- * Process:
- * 1. Check if any stages should separate (automatic staging)
- * 2. Calculate total mass and thrust from all active stages
- * 3. Apply forces (gravity, thrust, drag)
- * 4. Update velocity and position using kinematics
- * 5. Consume fuel from all burning stages
- * 6. Check for ground collision
- * 7. Track metrics (max altitude, time, etc.)
- * 
- * @param state - Current flight state
- * @param config - Rocket configuration (all stages)
- * @param simConfig - World settings (gravity, wind, drag)
- * @param deltaTime - Time since last frame (seconds)
- * @returns PhysicsFrame with updated state and events
+ * Advance the rocket simulation by one time step (Δt = deltaTime seconds).
+ *
+ * INTEGRATION METHOD: Explicit Euler (simple, good enough at small Δt)
+ *   v_new = v_old + a * Δt
+ *   x_new = x_old + v_new * Δt
+ *
+ * FORCE BUDGET (what accelerates the rocket):
+ *   1. Gravity        — constant −9.81 m/s² downward (always present)
+ *   2. Thrust         — along rocket's angle (sin/cos decomposition)
+ *   3. Aerodynamic drag — opposes velocity direction, proportional to speed
+ *   4. Wind           — constant lateral push from world config
+ *
+ * ANGULAR BUDGET:
+ *   1. Player input   — handled in applyControls() before this function
+ *   2. Damping        — reduces angularVelocity each frame
+ *   3. Restoring force— gentle spring back to vertical when no input
+ *
+ * @param state       Current flight state (MUTATED in place).
+ * @param config      Rocket configuration (stages, fuel, thrust).
+ * @param simConfig   World settings (gravity, wind, drag).
+ * @param deltaTime   Time step in seconds for this integration tick.
+ * @returns           PhysicsFrame: updated state + event flags.
  */
 export function updatePhysics(
   state: MultiStageRocketState,
@@ -162,141 +227,191 @@ export function updatePhysics(
   simConfig: SimulationConfig,
   deltaTime: number
 ): MultiStagePhysicsFrame {
-  // Track if ground was hit this frame
+  // Track whether ground contact occurred this frame (one-shot event trigger).
   let groundImpact = false;
 
-  // === STAGING CHECK ===
-  // This is the multi-stage logic: when a stage runs out of fuel, separate it
-  // and ignite the next stage automatically
+  // ── STAGING CHECK ──
+  // Automatic staging: when a stage empties its fuel tank, it separates and the
+  // next stage ignites at full throttle. Real rockets stage in milliseconds.
   const stagingSeparated = checkAndPerformStaging(config);
+  // Record whether a stage separated THIS frame — used for visual burst effect.
   state.didStageSeperateThisFrame = stagingSeparated;
 
-  // If a stage separated, increment our counter and update active stage number
   if (stagingSeparated) {
+    // Increment the separation counter (displayed in telemetry).
     state.stageSeparationCount++;
-    // Find the currently active stage
+    // Find which stage is now active and update the active stage index.
     for (let i = 0; i < config.stages.length; i++) {
       if (config.stages[i].isActive) {
+        // The first active (non-separated) stage is the one now in control.
         state.activeStageNumber = i;
-        break;
+        break; // Only one stage is active at a time — stop searching after finding it.
       }
     }
   }
 
-  // === FORCE CALCULATIONS ===
-  // Start with zero acceleration (no forces yet)
+  // ── INITIALIZE ACCELERATION ──
+  // Start with zero acceleration; forces are added below.
   let accelerationX = 0;
   let accelerationY = 0;
 
-  // Calculate current total mass of all active (non-separated) stages plus payload
-  // This is crucial: as fuel burns and stages separate, mass decreases
-  // Lower mass = same thrust = higher acceleration (F = m*a, so a = F/m)
+  // ── TOTAL MASS ──
+  // Sum of all non-separated stage masses (dry + fuel) plus payload.
+  // Mass decreases as fuel burns and stages separate.
+  // This is critical: lighter rocket → same thrust → higher acceleration (a = F/m).
   const totalMass = calculateTotalMass(config);
 
-  // Calculate total thrust from all currently thrusting stages
-  // This sums the thrust from each active stage
+  // ── TOTAL THRUST ──
+  // Sum of thrust (N) from all stages currently firing (active, not separated, has fuel, throttle > 0).
   const totalThrust = calculateTotalThrust(config);
 
-  // === GRAVITY ===
-  // Gravity pulls down with constant acceleration
-  // Negative because down is negative Y
+  // ── GRAVITY ──
+  // Always acts downward: −g in the Y direction.
+  // Negative because our Y axis is positive-up and gravity pulls down.
   accelerationY -= simConfig.gravity;
 
-  // === THRUST ===
-  // Apply total thrust to all stages to the rocket
-  // Using Newton's 2nd law: a = F / m
-  // Thrust acts upward (positive Y)
+  // ── THRUST ──
+  // Thrust acts along the rocket's pointing direction, decomposed into X and Y components.
+  //   thrustX = sin(angle) * totalThrust / totalMass
+  //     — At angle=0 (vertical): sin(0)=0, so no horizontal thrust component.
+  //     — At angle=+π/6 (30° right): sin(π/6)=0.5, so 50% of thrust pushes right.
+  //   thrustY = cos(angle) * totalThrust / totalMass
+  //     — At angle=0: cos(0)=1, so 100% of thrust pushes up.
+  //     — At angle=+π/6: cos(π/6)≈0.866, so 86.6% of thrust still pushes up.
+  // This is the rocket steering mechanic: tilting sacrifices some vertical thrust
+  // for horizontal velocity, which is exactly how real gravity-turn launches work.
   if (totalThrust > 0) {
-    accelerationY += totalThrust / totalMass;
+    // Horizontal acceleration from thrust (positive angle = thrust pushes right).
+    accelerationX += Math.sin(state.angle) * totalThrust / totalMass;
+    // Vertical acceleration from thrust (always positive at angle < 90°).
+    accelerationY += Math.cos(state.angle) * totalThrust / totalMass;
   }
 
-  // === DRAG ===
-  // Air resistance opposes motion (simplified model)
-  // Drag force = dragCoefficient * velocity
-  // Higher velocity = more drag
+  // ── AERODYNAMIC DRAG ──
+  // Drag opposes motion and is proportional to speed (simplified linear model).
+  // Real rockets use drag = 0.5 * ρ * v² * Cd * A, but for gameplay the linear
+  // approximation is good enough and avoids needing atmospheric density tables.
 
-  // Drag opposing horizontal motion
   if (state.velocity.x !== 0) {
+    // Horizontal drag force magnitude (N) — scales with horizontal speed.
     const dragForceX = simConfig.dragCoefficient * Math.abs(state.velocity.x);
-    // Drag opposes direction of motion
+    // Acceleration from drag in X — negative sign of velocity means it opposes motion.
+    // Math.sign() returns +1 or -1 based on velocity direction.
     accelerationX -= (dragForceX / totalMass) * Math.sign(state.velocity.x);
   }
 
-  // Drag opposing vertical motion
   if (state.velocity.y !== 0) {
+    // Vertical drag force magnitude — scales with vertical speed.
     const dragForceY = simConfig.dragCoefficient * Math.abs(state.velocity.y);
-    // Drag opposes direction of motion
+    // Vertical drag opposes vertical motion direction.
     accelerationY -= (dragForceY / totalMass) * Math.sign(state.velocity.y);
   }
 
-  // === WIND ===
-  // If there's wind in the world, it affects horizontal acceleration
+  // ── WIND ──
+  // Lateral wind push. Treated as a constant horizontal force (not velocity-dependent).
+  // The wind force is scaled so larger rockets are pushed less (because F/m is smaller).
   if (simConfig.windSpeed.x !== 0) {
-    // Wind pushes the rocket sideways
-    // The wind has a fixed force, so smaller rockets (lower mass) are pushed more
-    const windForce = simConfig.windSpeed.x * 1000; // Scale wind force
+    // Wind "force" = windSpeed * 1000 N — a 3 m/s breeze applies 3000 N of force.
+    // Dividing by totalMass converts force to acceleration (a = F/m).
+    const windForce = simConfig.windSpeed.x * 1000;
     accelerationX += windForce / totalMass;
   }
 
-  // Store acceleration in state (useful for UI display)
+  // Store the net acceleration in state for UI display in the telemetry panel.
   state.acceleration.x = accelerationX;
   state.acceleration.y = accelerationY;
 
-  // === VELOCITY UPDATE ===
-  // v_new = v_old + a * dt
-  // This is basic kinematics: velocity changes based on acceleration
+  // ── VELOCITY INTEGRATION ──
+  // Euler integration: v_new = v_old + a * Δt
+  // This is an approximation but accurate enough at small Δt (≤ 0.016s at 60fps).
   state.velocity.x += accelerationX * deltaTime;
   state.velocity.y += accelerationY * deltaTime;
 
-  // === POSITION UPDATE ===
-  // x_new = x_old + v * dt
-  // This moves the rocket based on how fast it's moving
+  // ── POSITION INTEGRATION ──
+  // x_new = x_old + v_new * Δt
+  // Using v_new (semi-implicit Euler) is slightly more stable than using v_old.
   state.position.x += state.velocity.x * deltaTime;
   state.position.y += state.velocity.y * deltaTime;
 
-  // === FUEL CONSUMPTION ===
-  // Consume fuel from all burning stages
-  // This updates the fuelMass in each stage based on burn rate and throttle
+  // ── FUEL CONSUMPTION ──
+  // Burn fuel from all active stages proportional to throttle% and burn rate (kg/s).
   consumeFuel(config, deltaTime);
 
-  // === MARK AS FLYING ===
-  // Once rocket goes above ground level, it's officially flying
+  // ── FLIGHT STATUS ──
+  // Mark as flying once the rocket clears ground level (>1 m).
   if (state.position.y > 1 && !state.isFlying) {
     state.isFlying = true;
   }
 
-  // === TRACK MAX ALTITUDE ===
-  // Keep record of highest point reached
+  // ── ANGULAR PHYSICS ──
+  // Update rotation from angular velocity, apply damping, and restore toward vertical.
+
+  // Angular damping: multiply angularVelocity by a decay factor each frame.
+  // The factor is (1 - ANGULAR_DAMPING * Δt), approaching zero exponentially.
+  // This simulates aerodynamic fins and atmospheric drag slowing the spin.
+  state.angularVelocity *= Math.max(0, 1 - ANGULAR_DAMPING * deltaTime);
+
+  // Restoring force: a gentle spring pulling the rocket back toward angle=0 (vertical).
+  // When no steering input and the rocket is flying, this gradually straightens the rocket.
+  // Force is proportional to how far off-vertical it is: further tilted = stronger pull.
+  // Only applied when not on the ground (we don't wobble on the launchpad).
+  if (state.isFlying) {
+    // -state.angle * rate: if tilted right (+angle), force is negative (pulls left).
+    // Multiplied by deltaTime so it's frame-rate independent (rad/s per radian of tilt).
+    state.angularVelocity -= state.angle * ANGULAR_RESTORE_RATE * deltaTime;
+  }
+
+  // Integrate angle from angular velocity (angle_new = angle_old + ω * Δt).
+  state.angle += state.angularVelocity * deltaTime;
+
+  // Clamp angle to the maximum tilt limit to keep the rocket somewhat vertical.
+  // Beyond 60° the physics becomes unrealistic (nearly horizontal rocket).
+  state.angle = Math.max(-MAX_TILT_ANGLE, Math.min(MAX_TILT_ANGLE, state.angle));
+
+  // Force the rocket to stand upright when on the ground (before and after flight).
+  if (!state.isFlying) {
+    state.angle = 0;           // Always vertical on the launchpad
+    state.angularVelocity = 0; // No spin when on the ground
+  }
+
+  // ── MAX ALTITUDE TRACKING ──
   if (state.position.y > state.maxAltitudeReached) {
+    // New peak altitude — update the record.
     state.maxAltitudeReached = state.position.y;
   }
 
-  // === GROUND COLLISION ===
-  // Check if rocket hit the ground (y <= 0)
-  if (state.position.y <= 0) {
-    // Snap to exactly ground level
+  // ── GROUND COLLISION ──
+  // Detect when the rocket falls back to y ≤ 0 (ground level).
+  if (state.position.y <= 0 && state.isFlying) {
+    // Snap exactly to ground to prevent the rocket from going underground.
     state.position.y = 0;
 
-    // Record landing velocity (how fast we were going)
+    // Record the velocity at impact (negative = coming down, as expected).
     state.landingVelocity = state.velocity.y;
 
-    // Stop all motion (crash!)
+    // Stop all motion — the rocket has landed/crashed.
     state.velocity.x = 0;
     state.velocity.y = 0;
+    state.angularVelocity = 0; // Also stop spinning on impact
 
-    // Mark flight as over
+    // Clear flight flags.
     state.isFlying = false;
     state.hasLanded = true;
 
-    // Signal ground impact
+    // Signal that ground impact happened this frame.
     groundImpact = true;
   }
 
-  // === UPDATE TIME ===
-  // Track how long the simulation has been running
+  // Also clamp if below ground when NOT flying (e.g., on initial placement).
+  if (state.position.y < 0 && !state.isFlying) {
+    state.position.y = 0;
+  }
+
+  // ── TIME TRACKING ──
+  // Accumulate elapsed simulation time (seconds).
   state.timeElapsed += deltaTime;
 
-  // Return updated state and event flags
+  // Return the updated state and event flags.
   return {
     state,
     deltaTime,
@@ -304,82 +419,76 @@ export function updatePhysics(
   };
 }
 
+// ─── RESET ────────────────────────────────────────────────────────────────────
+
 /**
- * Reset the rocket for a new launch.
- * Refills fuel, resets position, and reactivates first stage.
- * 
- * @param state - The flight state to reset
- * @param config - The rocket configuration to reset
+ * Reset the rocket to launch-ready state.
+ * Refills all fuel tanks, zeros position/velocity/rotation, resets all metrics.
+ *
+ * @param state  The flight state object to reset (mutated in place).
+ * @param config The rocket configuration to reset (stages refilled via resetAllStages).
  */
 export function resetRocket(
   state: MultiStageRocketState,
   config: MultiStageRocketConfig
 ): void {
-  // === RESET POSITION ===
-  // Back to ground, centered
+  // ── RESET POSITION — back on the pad at origin ──
   state.position.x = 0;
   state.position.y = 0;
 
-  // === RESET MOTION ===
-  // Stop all movement
+  // ── RESET MOTION — stationary ──
   state.velocity.x = 0;
   state.velocity.y = 0;
   state.acceleration.x = 0;
   state.acceleration.y = 0;
 
-  // === RESET FLIGHT STATE ===
-  // Not flying anymore
+  // ── RESET ROTATION — perfectly vertical ──
+  state.angle = 0;           // Back to straight-up orientation
+  state.angularVelocity = 0; // No spin
+
+  // ── RESET FLIGHT STATUS ──
   state.isFlying = false;
   state.hasLanded = false;
   state.landingVelocity = 0;
 
-  // === RESET METRICS ===
-  // Clear records
+  // ── RESET METRICS ──
   state.maxAltitudeReached = 0;
   state.timeElapsed = 0;
-  state.activeStageNumber = 0;
-  state.stageSeparationCount = 0;
+  state.activeStageNumber = 0;      // First stage is active again
+  state.stageSeparationCount = 0;   // No separations
   state.didStageSeperateThisFrame = false;
 
-  // === RESET ALL STAGES ===
-  // Refill fuel tanks, reattach stages, turn off engines
+  // ── RESET STAGES — refill tanks, reattach stages, shut off engines ──
   resetAllStages(config);
 }
 
+// ─── LANDING SCORE ────────────────────────────────────────────────────────────
+
 /**
- * Calculate landing quality score (0-100).
- * Soft landings (low velocity) score higher.
- * Hard crashes (high velocity) score lower.
- * 
- * @param landingVelocity - Speed when hitting ground (m/s, negative = downward)
- * @returns Score from 0 (crash) to 100 (perfect landing)
+ * Score the quality of a landing on a 0–100 scale.
+ * Based purely on impact speed: slower = better.
+ *
+ * @param landingVelocity Speed at ground impact (m/s, sign doesn't matter).
+ * @returns               Integer score 0 (crash) to 100 (perfect soft landing).
  */
 export function calculateLandingScore(landingVelocity: number): number {
-  // Convert to absolute speed (we don't care about direction, just magnitude)
+  // Use absolute speed — we don't care whether it was falling or somehow rising.
   const speed = Math.abs(landingVelocity);
 
-  // Safe soft landing (very gentle)
-  if (speed < 5) return 100;
-
-  // Good landing (gentle)
-  if (speed < 10) return 80;
-
-  // Acceptable landing (moderate impact)
-  if (speed < 20) return 60;
-
-  // Hard landing (rough impact but may survive)
-  if (speed < 40) return 30;
-
-  // Crash (extremely hard impact)
-  return 0;
+  if (speed < 5)  return 100; // Near-perfect: < 5 m/s, like setting a glass down gently
+  if (speed < 10) return 80;  // Very good: 5–10 m/s, light bounce
+  if (speed < 20) return 60;  // Acceptable: 10–20 m/s, survivable impact
+  if (speed < 40) return 30;  // Hard: 20–40 m/s, significant structural damage
+  return 0;                    // Crash: > 40 m/s, total loss
 }
 
+// ─── FUEL STATUS QUERY ────────────────────────────────────────────────────────
+
 /**
- * Get information about fuel status of all stages.
- * Useful for displaying stage-by-stage telemetry in UI.
- * 
- * @param config - The rocket configuration
- * @returns Array of fuel status for each stage
+ * Return per-stage fuel status for display in the telemetry UI.
+ *
+ * @param config The rocket configuration.
+ * @returns      Array with one entry per stage (fuel%, separated, active).
  */
 export function getStageFuelStatus(config: MultiStageRocketConfig): Array<{
   stageNumber: number;
@@ -391,7 +500,7 @@ export function getStageFuelStatus(config: MultiStageRocketConfig): Array<{
   return config.stages.map((stage) => ({
     stageNumber: stage.stageNumber,
     name: stage.name,
-    // Calculate fuel as percentage of capacity
+    // Express fuel as a 0–100% fraction of initial capacity.
     fuelPercent: (stage.fuelMass / stage.fuelCapacity) * 100,
     isSeparated: stage.isSeparated,
     isActive: stage.isActive,

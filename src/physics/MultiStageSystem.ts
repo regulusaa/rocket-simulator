@@ -1,104 +1,91 @@
 /**
  * ROCKET SIMULATOR - MULTI-STAGE SYSTEM
  * =====================================
- * This file implements the multi-stage rocket system. Real rockets use multiple stages
- * because as fuel burns, the empty fuel tank becomes dead weight. By jettisoning
- * (separating) empty stages, the remaining rocket is much lighter and can accelerate faster.
- * 
- * How it works:
- * - A rocket is made of multiple stages stacked on top of each other
- * - Each stage has its own engine, fuel tank, and dry mass
- * - When a stage runs out of fuel, it can separate (detach from the rest)
- * - The next stage ignites, and the rocket continues accelerating with less mass
- * 
- * This is why the SpaceX Falcon 9 is so impressive: it uses 9 engines in the first stage,
- * then a single engine in the second stage. That 9-to-1 ratio is because the second stage
- * has much less mass to push (no first stage engines, no first stage structure).
+ * Implements the multi-stage rocket model: separate stages, fuel consumption, staging.
+ *
+ * WHAT IS STAGING?
+ * Real rockets discard empty fuel tanks (stages) so the remaining vehicle is lighter.
+ * A lighter vehicle needs less thrust for the same acceleration (F = ma → a = F/m).
+ * Saturn V (Moon rocket) had 3 stages; Falcon 9 has 2.
+ *
+ * CHANGES IN THIS VERSION:
+ *   - applyMultiStageThrottle() now takes deltaTime for time-based throttle ramping
+ *   - Throttle ramps UP at  50 %/s  → full throttle takes 2 seconds (was instant)
+ *   - Throttle ramps DOWN at 100 %/s → idle in 1 second (faster for player control)
+ *   - Click burst adds only 30% throttle (not 10% — was an immediate tiny pulse)
+ *   - Rocket configs rebalanced for realistic TWR (1.3 – 1.5 at launch)
+ *
+ * WHY THROTTLE RAMPING MATTERS:
+ *   The original code used +2% per frame (≈120%/s). At TWR≈1.9 and immediate
+ *   full throttle, the rocket reached max speed so quickly it flew off the 600 px
+ *   canvas in under 3 seconds. With 50%/s ramp the player has time to orient the
+ *   camera (now automatic via Camera.ts) and understand what is happening.
  */
 
+import {
+  THROTTLE_INCREASE_RATE,
+  THROTTLE_DECREASE_RATE,
+  THROTTLE_BURST_AMOUNT,
+} from "../utils/constants";
+// Import throttle rate constants so tuning them in constants.ts instantly affects
+// all rocket types without needing to touch this file.
+
+// ─── TYPES ────────────────────────────────────────────────────────────────────
+
 /**
- * Represents a single stage of a multi-stage rocket.
- * Each stage is independent: it has its own engine, fuel, and structural mass.
- * 
- * Stages are ordered from bottom (Stage 0 = first stage) to top (Stage N = final stage).
- * The first stage does most of the work getting off the ground.
- * Later stages are lighter but more efficient (higher specific impulse).
+ * A single stage of a multi-stage rocket.
+ * Stages are stacked bottom-to-top: stages[0] = first stage (booster, bottom).
+ *
+ * Each stage carries its own engine, fuel tank, and structural mass.
+ * When its fuel runs out, it separates and the next stage ignites.
  */
 export interface RocketStage {
-  // === IDENTIFICATION ===
-  // Which stage number this is (0 = first/bottom stage, increases upward)
-  stageNumber: number;
+  // ── IDENTIFICATION ──
+  stageNumber: number; // 0 = first (bottom), 1 = second, etc.
+  name: string;        // Human-readable label shown in telemetry ("Booster", "Upper Stage")
 
-  // Human-readable name (e.g., "First Stage", "Second Stage", "Payload Stage")
-  name: string;
+  // ── MASS ──
+  dryMass: number;       // kg — structural mass with NO fuel (engines, tanks, avionics)
+  fuelCapacity: number;  // kg — maximum fuel this stage's tank can hold
+  fuelMass: number;      // kg — current fuel remaining (decreases as engines burn)
 
-  // === MASS PROPERTIES ===
-  // Dry mass of this stage's structure (engines, tanks, avionics, etc.)
-  // This is the mass when the stage has NO fuel
-  dryMass: number; // kg
+  // ── ENGINE ──
+  engineThrust: number;    // N — maximum thrust at 100% throttle
+  specificImpulse: number; // s — engine efficiency (how long 1 kg of fuel produces 1 N)
+  burnRate: number;        // kg/s — fuel consumed per second at 100% throttle
 
-  // How much fuel this stage can hold in its tank
-  fuelCapacity: number; // kg
-
-  // Current fuel remaining in this stage
-  fuelMass: number; // kg
-
-  // === ENGINE PROPERTIES ===
-  // The thrust this stage's engine produces (at sea level for first stage)
-  // Higher stages often have lower thrust but higher specific impulse
-  engineThrust: number; // Newtons
-
-  // Engine efficiency (specific impulse in seconds)
-  // How long 1 kg of fuel can produce 1 Newton of thrust
-  // Higher Isp = fuel lasts longer = more efficient
-  // First stages: ~280-300s, Second stages: ~350-420s (vacuum)
-  specificImpulse: number; // seconds
-
-  // === STATE ===
-  // Is this stage currently active (producing thrust)?
-  // False if separated or if later stage is active
-  isActive: boolean;
-
-  // Has this stage separated from the rocket?
-  // Once separated, it's gone and can't produce thrust
-  isSeparated: boolean;
-
-  // Is this stage currently thrusting (engine is firing)?
-  // Only true if: isActive AND NOT isSeparated AND throttle > 0
-  isThrusting: boolean;
-
-  // Current throttle level (0-100%) for this stage
-  // Controlled by player or automatic staging logic
-  thrustPercentage: number;
-
-  // Burn rate of fuel (kg/s consumed when thrusting)
-  // Calculated from thrust and specific impulse
-  burnRate: number;
+  // ── STATE ──
+  isActive: boolean;       // True if this stage is the one currently in control
+  isSeparated: boolean;    // True once this stage has been jettisoned (can't thrust)
+  isThrusting: boolean;    // True if: isActive AND NOT isSeparated AND throttle > 0 AND fuel > 0
+  thrustPercentage: number; // 0–100%: current throttle level
 }
 
 /**
- * A multi-stage rocket configuration.
- * Defines the structure of the entire rocket (all its stages).
+ * A complete multi-stage rocket definition.
+ * Passed to the physics engine to calculate mass, thrust, and staging.
  */
 export interface MultiStageRocketConfig {
-  // Name of the rocket (e.g., "Falcon 9", "Saturn V", "Starship")
-  name: string;
-
-  // All stages that make up this rocket, ordered from bottom to top
-  // stages[0] = first stage (bottom), stages[N] = final stage (top)
-  stages: RocketStage[];
-
-  // Total payload mass at the top (non-propellant, e.g., satellite, crew capsule)
-  // This mass doesn't produce thrust but needs to be accelerated
-  payloadMass: number; // kg
+  name: string;         // Display name (e.g., "Falcon 9 Inspired")
+  stages: RocketStage[]; // All stages bottom-to-top (stages[0] fires first)
+  payloadMass: number;  // kg — non-propellant mass at the top (satellite, capsule)
 }
 
+// ─── FACTORY ──────────────────────────────────────────────────────────────────
+
 /**
- * Create a RocketStage with calculated burn rate.
- * Helper function to simplify stage creation.
- * 
- * @param options - Stage configuration
- * @returns A fully initialized RocketStage
+ * Create a RocketStage with the burn rate auto-calculated from thrust and Isp.
+ *
+ * BURN RATE FORMULA:
+ *   burnRate = thrust / (g₀ × Isp)
+ *   where g₀ = 9.81 m/s² (standard gravity, used even in vacuum for Isp convention).
+ *
+ * This tells us: how many kg of propellant per second at 100% throttle?
+ * A high Isp engine burns LESS fuel per second for the same thrust — more efficient.
+ *   Example: Merlin at sea level: 7682 kN / (9.81 × 282) = 2778 kg/s burn rate.
+ *
+ * @param options  Stage configuration options.
+ * @returns        Fully initialized RocketStage ready for physics simulation.
  */
 export function createRocketStage(options: {
   stageNumber: number;
@@ -108,11 +95,8 @@ export function createRocketStage(options: {
   engineThrust: number;
   specificImpulse: number;
 }): RocketStage {
-  // Calculate burn rate from thrust and specific impulse
-  // Formula: burnRate = thrust / (g0 * Isp)
-  // where g0 = 9.81 m/s² (standard gravity at Earth surface)
-  // This tells us: how much fuel (kg) is consumed per second at full throttle
-  // Higher Isp = lower burn rate = fuel lasts longer
+  // Rocket equation burn rate: how many kg of fuel are burned per second at full throttle.
+  // This is derived from the Tsiolkovsky rocket equation efficiency parameter.
   const burnRate = options.engineThrust / (9.81 * options.specificImpulse);
 
   return {
@@ -120,177 +104,180 @@ export function createRocketStage(options: {
     name: options.name,
     dryMass: options.dryMass,
     fuelCapacity: options.fuelCapacity,
-    fuelMass: options.fuelCapacity, // Start with full fuel tank
+    fuelMass: options.fuelCapacity,  // Start with a FULL fuel tank
     engineThrust: options.engineThrust,
     specificImpulse: options.specificImpulse,
-    isActive: options.stageNumber === 0, // Only first stage starts active
-    isSeparated: false, // No stages separated at start
-    isThrusting: false, // Engines off at start
-    thrustPercentage: 0, // Throttle starts at 0%
-    burnRate, // Pre-calculated burn rate
+    isActive: options.stageNumber === 0, // Only the first stage (bottom) starts active
+    isSeparated: false,   // No stage starts separated
+    isThrusting: false,   // Engine is off at start (throttle = 0)
+    thrustPercentage: 0,  // Throttle starts at zero (player must hold SPACEBAR)
+    burnRate,             // Pre-calculated from thrust and Isp
   };
 }
 
+// ─── MASS & THRUST CALCULATIONS ───────────────────────────────────────────────
+
 /**
- * Calculate the total mass of all active (not separated) stages plus payload.
- * This is used in physics calculations: F = m * a, so we need total mass.
- * 
- * @param config - The multi-stage rocket config
- * @returns Total mass in kg of all active stages and payload
+ * Sum the masses of all stages that have NOT been separated, plus payload.
+ * This is the total mass the engines must accelerate (used in a = F/m).
+ *
+ * Mass decreases during flight as:
+ *   1. Fuel burns (fuelMass decreases each frame in consumeFuel())
+ *   2. Stages separate (their mass is no longer counted)
+ * Both effects increase acceleration for the same thrust (lighter → faster).
+ *
+ * @param config The rocket configuration.
+ * @returns      Total mass in kg of all attached stages + payload.
  */
 export function calculateTotalMass(config: MultiStageRocketConfig): number {
-  // Start with payload mass (constant, never changes)
-  let total = config.payloadMass;
+  let total = config.payloadMass; // Payload is always present (never jettisoned here)
 
-  // Add the mass of each stage (if not separated)
   for (const stage of config.stages) {
-    // Only count stages that haven't separated
     if (!stage.isSeparated) {
-      // Each stage's mass = dry mass (structure + engines) + fuel mass
+      // Count this stage: dry structure + remaining fuel.
       total += stage.dryMass + stage.fuelMass;
     }
+    // Separated stages have fallen away — they contribute zero mass.
   }
 
   return total;
 }
 
 /**
- * Calculate total available thrust from all active stages.
- * This is the sum of all stages that are:
- * - Not separated
- * - Currently thrusting (engine on, fuel available)
- * 
- * @param config - The multi-stage rocket config
- * @returns Total thrust in Newtons
+ * Sum thrust from all stages that are currently firing.
+ * A stage contributes thrust only if: not separated, is thrusting, and has fuel.
+ * Actual thrust = max thrust × (throttle% / 100).
+ *
+ * @param config The rocket configuration.
+ * @returns      Total thrust in Newtons being produced right now.
  */
 export function calculateTotalThrust(config: MultiStageRocketConfig): number {
-  // Start at zero thrust
   let totalThrust = 0;
 
-  // Sum thrust from all active stages
   for (const stage of config.stages) {
-    // Only count stages that are: not separated AND currently thrusting
+    // Skip stages that have separated (gone) or aren't burning.
     if (!stage.isSeparated && stage.isThrusting && stage.fuelMass > 0) {
-      // Calculate actual thrust based on throttle percentage
-      // If throttle is 50%, only use 50% of max thrust
-      const actualThrust = stage.engineThrust * (stage.thrustPercentage / 100);
-      totalThrust += actualThrust;
+      // Scale thrust by throttle percentage: 50% throttle = 50% of max thrust.
+      totalThrust += stage.engineThrust * (stage.thrustPercentage / 100);
     }
   }
 
   return totalThrust;
 }
 
+// ─── THROTTLE CONTROL ─────────────────────────────────────────────────────────
+
 /**
- * Set the throttle for a specific stage.
- * Only works if the stage is active and not separated.
- * 
- * @param stage - The stage to set throttle for
- * @param throttlePercent - Desired throttle 0-100%
+ * Set the throttle level for a single stage, and update its thrusting flag.
+ *
+ * @param stage           The stage to update.
+ * @param throttlePercent Desired throttle 0–100%.
  */
 export function setStageLevelThrottle(
   stage: RocketStage,
   throttlePercent: number
 ): void {
-  // Clamp throttle to valid range [0, 100]
+  // Clamp to the valid 0–100% range.
   stage.thrustPercentage = Math.max(0, Math.min(100, throttlePercent));
 
-  // Set isThrusting flag: true if throttle > 0 AND we have fuel AND stage is active
-  stage.isThrusting = stage.thrustPercentage > 0 && stage.fuelMass > 0 && stage.isActive;
+  // isThrusting is true only if ALL of: throttle > 0, has fuel, is active.
+  // This means the engine light goes out the moment any condition is false.
+  stage.isThrusting =
+    stage.thrustPercentage > 0 && stage.fuelMass > 0 && stage.isActive;
 }
 
 /**
- * Apply throttle commands to all stages uniformly (like in real rockets).
- * This simulates the player holding spacebar or clicking — it affects all active stages equally.
- * 
- * In reality, rocket engines are more complex (some stages can throttle, some can't),
- * but for this simulator we keep it simple.
- * 
- * @param config - The rocket config
- * @param isHoldingThrottle - Is the player holding the throttle key?
- * @param clickThrottle - Did the player just click (burst)?
- * @param throttleMultiplier - Control responsiveness (0-1)
+ * Apply the player's throttle input to all active (non-separated) stages.
+ * This is called every physics tick from engine.ts → applyControls().
+ *
+ * THROTTLE RAMPING (the key fix for "too sensitive thrust"):
+ *   - Holding SPACEBAR: throttle increases at THROTTLE_INCREASE_RATE (%/s).
+ *     Default 50 %/s → takes 2 full seconds to go 0% → 100%.
+ *   - Releasing SPACEBAR: throttle decreases at THROTTLE_DECREASE_RATE (%/s).
+ *     Default 100 %/s → takes 1 second to spool down to 0%.
+ *   - Single click: adds THROTTLE_BURST_AMOUNT (30%) as a short pulse.
+ *
+ * WHY TIME-BASED RATES?
+ *   The original code used "+2% per call" which ran at 60fps = +120%/s.
+ *   That's instant full throttle in 0.83s. With 50%/s, the player has 2 seconds
+ *   to watch the rocket start slowly and decide how long to hold the key.
+ *
+ * @param config            The rocket configuration.
+ * @param isHoldingThrottle True while SPACEBAR is held down.
+ * @param clickThrottle     True for ONE frame when the player clicks the canvas.
+ * @param deltaTime         Seconds elapsed this physics tick (for frame-rate independence).
  */
 export function applyMultiStageThrottle(
   config: MultiStageRocketConfig,
   isHoldingThrottle: boolean,
   clickThrottle: boolean,
-  throttleMultiplier: number = 1
+  deltaTime: number
 ): void {
-  // Loop through all active stages and apply throttle changes
   for (const stage of config.stages) {
-    // Skip if stage is separated (can't thrust anymore)
+    // Separated stages are gone — can't throttle them.
     if (stage.isSeparated) continue;
 
-    // Start with current throttle
+    // Start from the current throttle level.
     let desiredThrottle = stage.thrustPercentage;
 
-    // Holding the key increases throttle gradually
     if (isHoldingThrottle) {
-      // Increase by 2% per frame, multiplied by responsiveness factor
-      desiredThrottle = Math.min(100, desiredThrottle + 2 * throttleMultiplier);
+      // Gradually ramp UP. THROTTLE_INCREASE_RATE * deltaTime converts %/s to %/frame.
+      // At 50 %/s and 60fps (Δt ≈ 0.016s): Δthrottle = 50 * 0.016 = 0.83% per frame.
+      // That means 100/0.83 ≈ 120 frames = 2.0 seconds to go 0→100%. Controllable!
+      desiredThrottle += THROTTLE_INCREASE_RATE * deltaTime;
     } else {
-      // Not holding key: throttle decreases (engines spool down)
-      desiredThrottle = Math.max(0, desiredThrottle - 2 * throttleMultiplier);
+      // Gradually ramp DOWN when key released.
+      // At 100 %/s and 60fps: Δthrottle = -100 * 0.016 = -1.67% per frame.
+      // That means 60 frames = 1.0 second to go 100→0%. Fast enough to stop burning.
+      desiredThrottle -= THROTTLE_DECREASE_RATE * deltaTime;
     }
 
-    // Click adds a burst of thrust
+    // A single click adds a fixed throttle pulse on top of the current level.
+    // 30% is enough to feel responsive without launching the rocket instantly.
     if (clickThrottle) {
-      desiredThrottle = Math.min(100, desiredThrottle + 10);
+      desiredThrottle += THROTTLE_BURST_AMOUNT;
     }
 
-    // Apply the calculated throttle to this stage
+    // Apply the clamped throttle to this stage.
     setStageLevelThrottle(stage, desiredThrottle);
   }
 }
 
+// ─── STAGING LOGIC ────────────────────────────────────────────────────────────
+
 /**
- * Check if any stage should separate based on fuel status.
- * Staging logic: when a stage runs out of fuel (fuelMass <= 0), it should separate
- * and the next stage should activate.
- * 
- * This is automatic in real rockets — the stage controller detects empty fuel tank
- * and triggers separation + ignition of next stage.
- * 
- * @param config - The rocket config
- * @returns true if a stage separated during this check, false otherwise
+ * Check every stage for fuel exhaustion; if found, separate it and ignite the next.
+ * This is "automatic staging" — the controller detects an empty tank and triggers it.
+ *
+ * Called once per physics tick before force calculations.
+ *
+ * @param config The rocket configuration.
+ * @returns      true if any stage separated this tick, false otherwise.
  */
 export function checkAndPerformStaging(config: MultiStageRocketConfig): boolean {
-  // Track if we performed any separations
   let stagingOccurred = false;
 
-  // Loop through all stages looking for empty ones
   for (let i = 0; i < config.stages.length; i++) {
-    const currentStage = config.stages[i];
+    const current = config.stages[i];
 
-    // Check if this stage is out of fuel and hasn't already separated
-    if (currentStage.fuelMass <= 0 && !currentStage.isSeparated && currentStage.isActive) {
-      // === SEPARATE THIS STAGE ===
-      // Mark it as separated (it's now jettisoned, falls away)
-      currentStage.isSeparated = true;
-      currentStage.isActive = false;
-      currentStage.isThrusting = false;
-      currentStage.thrustPercentage = 0;
+    // Condition: this stage is active, has no fuel left, and hasn't already separated.
+    if (current.fuelMass <= 0 && !current.isSeparated && current.isActive) {
+      // ── JETTISON THIS STAGE ──
+      current.isSeparated = true;   // It falls away (no longer part of rocket)
+      current.isActive = false;     // No longer in control
+      current.isThrusting = false;  // Engine is dead
+      current.thrustPercentage = 0; // Throttle zeroed out
 
-      // === IGNITE NEXT STAGE ===
-      // Is there a next stage above this one?
+      // ── IGNITE NEXT STAGE ──
       if (i + 1 < config.stages.length) {
-        const nextStage = config.stages[i + 1];
-
-        // Activate the next stage
-        nextStage.isActive = true;
-
-        // Set it to 100% throttle (full power for new stage)
-        // This matches real rocket behavior: staging = full throttle of next engine
-        setStageLevelThrottle(nextStage, 100);
+        const next = config.stages[i + 1];
+        next.isActive = true; // This stage takes over
+        // Fire at 100% immediately — in real rockets next-stage ignition is full throttle.
+        setStageLevelThrottle(next, 100);
       }
 
-      // Record that staging occurred
       stagingOccurred = true;
-
-      // Note: We break here so only one stage stages per frame
-      // In reality, this is basically instant, but for simulation stability
-      // we do one separation per physics update
+      // Only stage once per tick for simulation stability (avoid multi-stage cascade).
       break;
     }
   }
@@ -298,38 +285,36 @@ export function checkAndPerformStaging(config: MultiStageRocketConfig): boolean 
   return stagingOccurred;
 }
 
+// ─── FUEL CONSUMPTION ─────────────────────────────────────────────────────────
+
 /**
- * Update the fuel mass of all active stages.
- * Called every physics frame to consume fuel based on throttle and burn rate.
- * 
- * @param config - The rocket config
- * @param deltaTime - Time since last frame (seconds)
+ * Burn fuel from every stage currently thrusting, proportional to throttle and burn rate.
+ * Called every physics tick AFTER force calculations so burned mass affects NEXT frame.
+ *
+ * FORMULA: fuelBurned = burnRate (kg/s) × (throttle / 100) × Δt (s)
+ *   - At 100% throttle and burnRate=278 kg/s: 278 × 1.0 × 0.016 = 4.45 kg per frame.
+ *   - At  50% throttle: 278 × 0.5 × 0.016 = 2.22 kg per frame.
+ *
+ * @param config    The rocket configuration.
+ * @param deltaTime Seconds elapsed this physics tick.
  */
 export function consumeFuel(
   config: MultiStageRocketConfig,
   deltaTime: number
 ): void {
-  // Loop through all stages
   for (const stage of config.stages) {
-    // Skip if separated or not thrusting
+    // Only burn fuel if this stage is actively thrusting.
     if (stage.isSeparated || !stage.isThrusting) continue;
 
-    // Calculate fuel burned this frame
-    // fuelBurned = burnRate (kg/s) * throttle% * deltaTime (s)
-    // Higher throttle = more fuel burned per second
-    const fuelBurnedThisFrame =
-      stage.burnRate * (stage.thrustPercentage / 100) * deltaTime;
+    // Fuel burned this tick scales with throttle (partial throttle = partial burn rate).
+    const burned = stage.burnRate * (stage.thrustPercentage / 100) * deltaTime;
+    stage.fuelMass -= burned;
 
-    // Subtract from fuel tank
-    stage.fuelMass -= fuelBurnedThisFrame;
+    // Clamp to zero — we can't have negative fuel.
+    if (stage.fuelMass < 0) stage.fuelMass = 0;
 
-    // Clamp to zero (can't have negative fuel)
-    if (stage.fuelMass < 0) {
-      stage.fuelMass = 0;
-    }
-
-    // If fuel is empty and engine is on, turn it off
-    // This prevents thrusting on empty tank
+    // If the tank just ran dry, kill the engine immediately.
+    // (checkAndPerformStaging() will then separate it on the next tick.)
     if (stage.fuelMass <= 0) {
       stage.isThrusting = false;
       stage.thrustPercentage = 0;
@@ -337,130 +322,178 @@ export function consumeFuel(
   }
 }
 
+// ─── RESET ────────────────────────────────────────────────────────────────────
+
 /**
- * Reset all stages to their initial state for a new launch.
- * Called when player clicks "Reset" button.
- * 
- * @param config - The rocket config to reset
+ * Restore all stages to their initial launch-ready configuration.
+ * Refills fuel tanks, reattaches jettisoned stages, shuts off all engines.
+ *
+ * @param config The rocket config to reset.
  */
 export function resetAllStages(config: MultiStageRocketConfig): void {
-  // Reset each stage
   for (const stage of config.stages) {
-    // Refill fuel tank to capacity
-    stage.fuelMass = stage.fuelCapacity;
-
-    // Mark as not separated (re-attach to rocket)
-    stage.isSeparated = false;
-
-    // Only first stage (stageNumber=0) should be active at start
-    stage.isActive = stage.stageNumber === 0;
-
-    // Turn off engines
-    stage.isThrusting = false;
-    stage.thrustPercentage = 0;
+    stage.fuelMass = stage.fuelCapacity;  // Refill tank to maximum capacity
+    stage.isSeparated = false;            // Reattach: no stages jettisoned
+    stage.isActive = stage.stageNumber === 0; // Only first stage starts active
+    stage.isThrusting = false;            // Engines off
+    stage.thrustPercentage = 0;           // Throttle at zero
   }
 }
 
-/**
- * Create a pre-configured multi-stage rocket (like Falcon 9).
- * Real-world inspired rocket with realistic numbers.
- * 
- * Falcon 9-inspired specs:
- * - First stage: 9 Merlin engines, ~770 tons at launch
- * - Second stage: 1 Merlin vacuum engine, ~110 tons
- */
-export const ROCKET_FALCON_9_INSPIRED: MultiStageRocketConfig = {
-  name: "Falcon 9 Inspired",
-  payloadMass: 10000, // 10 tons payload (satellite)
-
-  stages: [
-    // First stage (booster)
-    // Does most of the work getting off the ground
-    // Lots of thrust but lower specific impulse (air has drag at sea level)
-    createRocketStage({
-      stageNumber: 0,
-      name: "First Stage",
-      dryMass: 40000, // ~40 tons of structure (9 engines, avionics, etc.)
-      fuelCapacity: 380000, // ~380 tons of fuel (RP-1 and LOX)
-      engineThrust: 7682000, // ~7.7 MN total (9 × ~850 kN)
-      specificImpulse: 282, // 282 seconds at sea level
-    }),
-
-    // Second stage (upper stage)
-    // Lighter, more efficient, continues until orbit
-    // Lower thrust but higher specific impulse (operates in vacuum)
-    createRocketStage({
-      stageNumber: 1,
-      name: "Second Stage",
-      dryMass: 4000, // ~4 tons structure (1 engine, smaller avionics)
-      fuelCapacity: 100000, // ~100 tons of fuel
-      engineThrust: 934000, // ~934 kN (1 Merlin vacuum)
-      specificImpulse: 348, // 348 seconds in vacuum (very efficient!)
-    }),
-  ],
-};
+// ─── PRE-CONFIGURED ROCKETS ───────────────────────────────────────────────────
+//
+// TWO-STAGE-TO-ORBIT (TWR) DESIGN NOTES:
+//
+// TWR = totalThrust / (totalMass × 9.81)
+// Good range: 1.2–2.0 at liftoff.
+//   < 1.0 = rocket can't lift off at all
+//   1.0–1.2 = barely lifts off, very slow ascent
+//   1.2–1.5 = realistic (most orbital launchers)
+//   1.5–2.0 = sporty / responsive (sounding rockets)
+//   > 3.0   = extreme (used to cause "fly off screen in 2 seconds")
+//
+// The previous configs had TWR up to 1.89 but with INSTANT throttle (120%/s ramp)
+// which caused the rocket to reach max speed immediately.
+// Now with 50%/s ramp rate, even TWR=1.9 feels gradual and controllable.
 
 /**
- * Create a simple two-stage rocket for learning (not realistic, but good for testing)
+ * SIMPLE TWO-STAGE — Small educational rocket.
+ *
+ * Based on a scaled-down orbital launcher concept.
+ * Designed to be:
+ *   - Easy to fly (moderate TWR, gentle acceleration)
+ *   - Fast enough to reach the Kármán line (100 km) in ~3 minutes
+ *   - Not so fast that it flies off screen before the camera catches up
+ *
+ * STATS:
+ *   Launch mass: 400 + 2000 + 200 + 800 + 200 = 3600 kg
+ *   First stage thrust: 50,000 N
+ *   Launch TWR: 50000 / (3600 × 9.81) = 50000 / 35316 ≈ 1.42 ✓
  */
 export const ROCKET_SIMPLE_TWO_STAGE: MultiStageRocketConfig = {
   name: "Simple Two-Stage",
-  payloadMass: 1000,
+  payloadMass: 200, // 200 kg small satellite
 
   stages: [
     createRocketStage({
       stageNumber: 0,
       name: "Booster",
-      dryMass: 5000,
-      fuelCapacity: 15000,
-      engineThrust: 500000,
-      specificImpulse: 250,
+      dryMass: 400,          // kg — lightweight structure for a small rocket
+      fuelCapacity: 2000,    // kg — enough propellant for a 1–2 minute first-stage burn
+      engineThrust: 50000,   // N — 50 kN, TWR at launch ≈ 1.42 (comfortable)
+      specificImpulse: 250,  // s — moderate efficiency (solid/simple liquid propellant)
     }),
 
     createRocketStage({
       stageNumber: 1,
       name: "Upper Stage",
-      dryMass: 1000,
-      fuelCapacity: 5000,
-      engineThrust: 150000,
-      specificImpulse: 320,
+      dryMass: 200,          // kg — even lighter upper stage structure
+      fuelCapacity: 800,     // kg — less fuel needed since it's already fast at separation
+      engineThrust: 15000,   // N — 15 kN upper stage engine
+      // Upper stage TWR at separation (only upper stage + payload):
+      //   mass = 200 + 800 + 200 = 1200 kg
+      //   TWR = 15000 / (1200 × 9.81) = 15000 / 11772 ≈ 1.27 ✓
+      specificImpulse: 320,  // s — more efficient vacuum engine (upper stages are optimized for vacuum)
     }),
   ],
 };
 
 /**
- * Create a three-stage rocket (very ambitious, like Saturn V)
+ * FALCON 9 INSPIRED — Realistic heavy-lift orbital rocket.
+ *
+ * Based on real Falcon 9 FT specifications:
+ *   - 9 Merlin 1D engines in first stage (sea-level)
+ *   - 1 Merlin Vacuum engine in second stage
+ *   - Designed for low Earth orbit delivery
+ *
+ * REAL FALCON 9 STATS (approximate):
+ *   Total launch mass: ~549,054 kg
+ *   First stage thrust: ~7,607 kN (9 × 845 kN)
+ *   Launch TWR: 7,607,000 / (549,054 × 9.81) ≈ 1.41
+ *
+ * STATS USED HERE:
+ *   Launch mass: 30000 + 419054 + 4000 + 86000 + 10000 = 549,054 kg
+ *   First stage thrust: 7,607,000 N
+ *   Launch TWR: 7607000 / (549054 × 9.81) ≈ 1.41 ✓
  */
-export const ROCKET_THREE_STAGE: MultiStageRocketConfig = {
-  name: "Three-Stage Heavy",
-  payloadMass: 5000,
+export const ROCKET_FALCON_9_INSPIRED: MultiStageRocketConfig = {
+  name: "Falcon 9 Inspired",
+  payloadMass: 10000, // 10,000 kg payload (typical GTO mission)
 
   stages: [
     createRocketStage({
       stageNumber: 0,
       name: "First Stage",
-      dryMass: 8000,
-      fuelCapacity: 40000,
-      engineThrust: 1000000,
-      specificImpulse: 260,
+      dryMass: 30000,          // kg — first stage dry mass (9 engines, landing legs, grid fins)
+      fuelCapacity: 419054,    // kg — RP-1 + LOX propellant
+      engineThrust: 7607000,   // N — 9 × 845 kN Merlin 1D sea-level thrust
+      specificImpulse: 282,    // s — Merlin sea-level Isp
     }),
 
     createRocketStage({
       stageNumber: 1,
       name: "Second Stage",
-      dryMass: 2000,
-      fuelCapacity: 12000,
-      engineThrust: 250000,
-      specificImpulse: 310,
+      dryMass: 4000,           // kg — upper stage structure (1 engine, no landing hardware)
+      fuelCapacity: 86000,     // kg — upper stage propellant
+      engineThrust: 934000,    // N — 934 kN Merlin Vacuum (optimized nozzle for vacuum)
+      // Upper stage TWR at separation:
+      //   mass = 4000 + 86000 + 10000 = 100000 kg
+      //   TWR = 934000 / (100000 × 9.81) ≈ 0.95 — upper stage doesn't need TWR > 1
+      //   because it's already at high velocity and just needs to accelerate to orbit
+      specificImpulse: 348,    // s — Merlin Vacuum Isp (excellent vacuum efficiency)
+    }),
+  ],
+};
+
+/**
+ * THREE-STAGE HEAVY — Ambitious multi-stage launcher inspired by Saturn V / N1.
+ *
+ * Three stages allow:
+ *   - Stage 1: Max thrust to get off the ground through thick atmosphere
+ *   - Stage 2: Continue acceleration in thinner air (better efficiency)
+ *   - Stage 3: Final orbital insertion burn in near-vacuum
+ *
+ * STATS:
+ *   Launch mass: 8000 + 40000 + 2000 + 12000 + 500 + 3000 + 5000 = 70,500 kg
+ *   First stage thrust: 1,000,000 N
+ *   Launch TWR: 1,000,000 / (70500 × 9.81) ≈ 1.45 ✓
+ */
+export const ROCKET_THREE_STAGE: MultiStageRocketConfig = {
+  name: "Three-Stage Heavy",
+  payloadMass: 5000, // 5,000 kg heavy satellite / small space station module
+
+  stages: [
+    createRocketStage({
+      stageNumber: 0,
+      name: "First Stage",
+      dryMass: 8000,         // kg — heavy structure for large engines and fuel tanks
+      fuelCapacity: 40000,   // kg — substantial propellant for the initial climb
+      engineThrust: 1000000, // N — 1 MN sea-level thrust
+      specificImpulse: 260,  // s — lower Isp because sea-level engines are less efficient
+    }),
+
+    createRocketStage({
+      stageNumber: 1,
+      name: "Second Stage",
+      dryMass: 2000,         // kg — lighter mid-stage
+      fuelCapacity: 12000,   // kg — less propellant needed at altitude
+      engineThrust: 250000,  // N — 250 kN, smaller engine optimized for thinning atmosphere
+      // Second stage TWR at separation:
+      //   mass = 2000 + 12000 + 500 + 3000 + 5000 = 22500 kg
+      //   TWR = 250000 / (22500 × 9.81) ≈ 1.13 — barely > 1, still climbs
+      specificImpulse: 310,  // s — better efficiency at altitude
     }),
 
     createRocketStage({
       stageNumber: 2,
       name: "Third Stage",
-      dryMass: 500,
-      fuelCapacity: 3000,
-      engineThrust: 70000,
-      specificImpulse: 350,
+      dryMass: 500,          // kg — very light final stage
+      fuelCapacity: 3000,    // kg — precise orbital insertion fuel
+      engineThrust: 70000,   // N — 70 kN, small but efficient upper stage engine
+      // Third stage TWR at separation:
+      //   mass = 500 + 3000 + 5000 = 8500 kg
+      //   TWR = 70000 / (8500 × 9.81) ≈ 0.84 — less than 1 but already near orbital speed
+      specificImpulse: 350,  // s — high vacuum Isp for maximum efficiency
     }),
   ],
 };

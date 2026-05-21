@@ -1,27 +1,41 @@
 /**
- * ROCKET SIMULATOR - FINAL COMPLETE VERSION (WITH AUDIO)
- * =======================================================
- * Complete integrated rocket simulator with all features:
- * - Multi-stage rocket physics and staging
- * - Advanced landing mechanics with parachutes
- * - Particle effects and trajectory visualization
- * - Real-time performance monitoring and optimization
- * - Complete audio system with sound effects
- * 
- * All systems fully integrated and optimized.
+ * ROCKET SIMULATOR - MAIN COMPONENT (FULLSCREEN + CAMERA VERSION)
+ * ================================================================
+ * The top-level React component that owns the entire simulator.
+ *
+ * ARCHITECTURE OVERVIEW:
+ *   - Canvas fills 100% of the browser window (window.innerWidth × window.innerHeight).
+ *   - A single game loop useEffect runs ONCE (empty dep array).
+ *     All physics, camera, and rendering happen inside this loop.
+ *     React state is never read inside the loop — only refs — to avoid stale closures.
+ *   - Mutable game data lives in refs (flightStateRef, rocketConfigRef, cameraRef, …).
+ *   - React state is used ONLY for UI elements that need re-rendering (top bar, modals).
+ *   - Every few frames the game loop syncs key values from refs → React state for UI.
+ *
+ * NEW FEATURES vs. OLD VERSION:
+ *   1. Fullscreen canvas with resize listener
+ *   2. Camera class: lerp tracking + logarithmic zoom + shake
+ *   3. Throttle ramping (50 %/s up, 100 %/s down) — no more instant full-thrust
+ *   4. Horizontal steering: A / D or Arrow keys apply angular velocity
+ *   5. Time controls: 1×/2×/5×/10× and PAUSE (keyboard 0-4)
+ *   6. Physics sub-stepping at high time multipliers (no tunneling)
+ *   7. Improved rocket visuals: tapered body, fins, porthole, curved nose, glow flame
+ *   8. Parallax star field (3-layer depth)
+ *   9. Camera shake during thrust and stage separation
  */
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import {
   createMultiStageRocket,
   updatePhysics,
-  resetRocket,
   applyControls,
   calculateLandingScore,
 } from "../physics/engine";
 import type { MultiStageRocketState } from "../physics/engine";
+
 import { TrajectoryPanel } from "./TrajectoryPanel";
 import { ParticleSystem } from "../physics/ParticleSystem";
+
 import {
   createParachute,
   createLandingGear,
@@ -33,1098 +47,1076 @@ import {
   type LandingGear,
   type LandingState,
 } from "../physics/LandingMechanics";
+
 import {
   PerformanceMonitor,
   TrajectoryLimiter,
-  getPerformanceStatus,
-  type PerformanceMetrics,
 } from "../utils/PerformanceMonitor";
-import { AudioManager, type SoundEffect } from "../utils/AudioSystem";
+
+import { AudioManager } from "../utils/AudioSystem";
+import { Camera } from "../utils/Camera";
+
 import {
   GRAVITY,
   DRAG_COEFFICIENT,
   ROCKET_RADIUS,
   PHYSICS_TICK_RATE,
   WIND_SPEED,
-  CANVAS_WIDTH,
-  CANVAS_HEIGHT,
-  PIXELS_PER_METER,
-  ROCKET_BODY_WIDTH,
-  ROCKET_NOSE_HEIGHT,
-  ROCKET_FLAME_HEIGHT_MIN,
-  ROCKET_FLAME_HEIGHT_MAX,
   COLORS,
   ALTITUDE_GOALS,
-  INFO_PANEL_WIDTH,
-  INFO_PANEL_HEIGHT,
   INFO_PANEL_MARGIN,
-  FONT_SIZE_MEDIUM,
-  FONT_SIZE_SMALL,
+  TRAJECTORY_PANEL_WIDTH,
+  TRAJECTORY_PANEL_HEIGHT,
   DEBUG_MODE,
 } from "../utils/constants";
+
 import {
   ROCKET_FALCON_9_INSPIRED,
   ROCKET_SIMPLE_TWO_STAGE,
   ROCKET_THREE_STAGE,
   type MultiStageRocketConfig,
+  resetAllStages,
 } from "../physics/MultiStageSystem";
+
 import type { AltitudeGoal } from "../physics/types";
 
+import {
+  generateStars,
+  drawBackground,
+  drawStars,
+  drawGround,
+  drawGoalLine,
+  drawRocket,
+  drawTelemetry,
+  drawPerfStats,
+  type Star,
+} from "../utils/drawHelpers";
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
 /**
- * Complete final RocketSimulator component with audio integration
+ * Deep-clone a rocket configuration object.
+ * The stages array in the original constants is module-level and would be
+ * MUTATED by the physics engine (fuelMass decreases each frame).
+ * By cloning before use, we ensure each flight starts with pristine full tanks,
+ * and resetting/switching rockets doesn't corrupt the original exported constants.
+ *
+ * @param config  The source rocket configuration to clone.
+ * @returns       A new config object with brand-new stage objects (full tanks).
+ */
+function cloneRocketConfig(config: MultiStageRocketConfig): MultiStageRocketConfig {
+  return {
+    ...config, // Shallow copy of config-level fields (name, payloadMass)
+    // Deep-copy the stages array so we get independent stage objects.
+    // Each stage is spread into a new object so mutations don't affect the original.
+    stages: config.stages.map((stage) => ({ ...stage })),
+  };
+}
+
+// ─── COMPONENT ───────────────────────────────────────────────────────────────
+
+/**
+ * RocketSimulator — the top-level component.
+ * Renders a fullscreen canvas with a game loop and React DOM overlays.
  */
 export const RocketSimulator: React.FC = () => {
-  // === REFS (persistent across renders) ===
 
-  // Canvas reference
+  // ── CANVAS REF ──────────────────────────────────────────────────────────────
+  // Direct reference to the <canvas> DOM element used for rendering.
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Animation frame ID
-  const animationFrameRef = useRef<number | null>(null);
+  // ── CANVAS SIZE STATE ────────────────────────────────────────────────────────
+  // React state for canvas dimensions so <canvas width={} height={}/> re-renders
+  // when the window is resized. Initialized to the current window size.
+  const [canvasWidth,  setCanvasWidth]  = useState(() => window.innerWidth);
+  const [canvasHeight, setCanvasHeight] = useState(() => window.innerHeight);
 
-  // Input tracking
+  // ── GAME-STATE REFS (used inside game loop — never stale) ────────────────────
+  // The game loop reads from refs so it doesn't need to be in the useEffect
+  // dependency array, which would restart the loop on every state change.
+
+  // Initial rocket config: start with a clone of the simple two-stage config.
+  // We clone so physics mutations (fuel burn) don't corrupt the exported constant.
+  const rocketConfigRef = useRef<MultiStageRocketConfig>(
+    cloneRocketConfig(ROCKET_SIMPLE_TWO_STAGE) // Clone to prevent constant mutation
+  );
+
+  // Flight state: position, velocity, angle, and all in-flight metrics.
+  const flightStateRef = useRef<MultiStageRocketState>(
+    createMultiStageRocket(rocketConfigRef.current) // Initial state from fresh config
+  );
+
+  // Camera: tracks the rocket with lerp smoothing + logarithmic zoom.
+  const cameraRef = useRef<Camera>(new Camera());
+
+  // Keys currently held down (set by keydown/keyup event listeners).
+  // Using an object (hash map) allows O(1) key-state lookup each frame.
   const keysPressed = useRef<{ [key: string]: boolean }>({});
 
-  // Particle system
+  // Particle system: manages exhaust trails, separation bursts, landing impacts.
   const particleSystemRef = useRef<ParticleSystem>(new ParticleSystem());
 
-  // Performance monitoring
-  const performanceMonitorRef = useRef<PerformanceMonitor>(
-    new PerformanceMonitor()
-  );
+  // Performance monitor: tracks FPS, frame time, physics time, render time.
+  const performanceMonitorRef = useRef<PerformanceMonitor>(new PerformanceMonitor());
 
-  // Trajectory optimization
+  // Trajectory limiter: caps the trajectory history array to prevent memory growth.
   const trajectoryLimiterRef = useRef(
-    new TrajectoryLimiter({
-      maxPoints: 50000,
-      sampleRate: 1,
-      cleanupInterval: 5,
-    })
+    new TrajectoryLimiter({ maxPoints: 50000, sampleRate: 1, cleanupInterval: 5 })
   );
 
-  // === NEW: AUDIO SYSTEM ===
-
-  // Audio manager for all sound effects
+  // Audio manager: plays all sound effects (engine, staging, landing).
   const audioManagerRef = useRef<AudioManager>(new AudioManager());
 
-  // Track previous throttle state for throttle up/down sounds
-  const previousThrottleRef = useRef<number>(0);
+  // Star field: pre-generated at startup, read every frame for rendering.
+  const starsRef = useRef<Star[]>([]);
 
-  // Track if engine is currently playing
-  const engineSoundPlayingRef = useRef<boolean>(false);
+  // Trajectory buffer: raw position history accumulated between React state syncs.
+  // We sync to React state every N frames rather than every frame to reduce re-renders.
+  const trajectoryBufferRef = useRef<Array<{ x: number; y: number }>>([]);
 
-  // === STATE ===
+  // rAF handle so we can cancel the loop on cleanup (component unmount).
+  const animationFrameRef = useRef<number | null>(null);
 
-  // Flight state
-  const [flightState, setFlightState] = useState<MultiStageRocketState>(() =>
-    createMultiStageRocket(ROCKET_SIMPLE_TWO_STAGE)
-  );
+  // ── LANDING MECHANICS REFS ────────────────────────────────────────────────
+  // Stored in refs (not React state) so they can be read/written in the game loop.
+  const parachuteRef    = useRef<Parachute>   (createParachute(100000, 1));   // Single-use chute
+  const landingGearRef  = useRef<LandingGear> (createLandingGear(500000));    // Shock-absorbing gear
+  const landingStateRef = useRef<LandingState>(createLandingState());          // Landing outcome
+  const parachuteDeployedRef = useRef<boolean>(false); // Edge-trigger: only deploy once per flight
 
-  // Rocket configuration
+  // ── AUDIO TRACKING REFS ────────────────────────────────────────────────────
+  // Track throttle and engine sound state to trigger sounds at the right moments.
+  const previousThrottleRef    = useRef<number>(0);   // Last frame's throttle (for change detection)
+  const engineSoundPlayingRef  = useRef<boolean>(false); // Is the looping engine sound active?
+  const sepShakeTimerRef       = useRef<number>(0);   // Countdown for stage-sep camera shake
+
+  // ── GAME-CONTROL REFS (synced FROM React state) ────────────────────────────
+  // These refs are written by small useEffects whenever the matching React state
+  // changes, so the game loop always reads the current value without being in deps.
+  const timeMultiplierRef      = useRef<number>(1);    // 1, 2, 5, or 10
+  const isPausedRef            = useRef<boolean>(false); // true = simulation frozen
+  const selectedGoalRef        = useRef<AltitudeGoal | null>(ALTITUDE_GOALS[0]);
+  const customGoalAltitudeRef  = useRef<number | null>(null);
+  const showPerfStatsRef       = useRef<boolean>(DEBUG_MODE);
+
+  // ── REACT STATE (for DOM / UI rendering) ─────────────────────────────────────
+
+  // Current rocket config used for the select box and reset logic.
+  // The actual physics-active config lives in rocketConfigRef.
   const [rocketConfig, setRocketConfig] = useState<MultiStageRocketConfig>(
-    ROCKET_SIMPLE_TWO_STAGE
+    rocketConfigRef.current // Initially matches the ref
   );
 
-  // Selected goal
-  const [selectedGoal, setSelectedGoal] = useState<AltitudeGoal | null>(
-    ALTITUDE_GOALS[0]
+  // Time multiplier shown on the time-control buttons.
+  const [timeMultiplier, setTimeMultiplier] = useState<number>(1);
+
+  // Pause state shown in the time-control buttons.
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+
+  // Selected altitude goal for the goal selector.
+  const [selectedGoal, setSelectedGoal] = useState<AltitudeGoal | null>(ALTITUDE_GOALS[0]);
+
+  // Custom altitude goal entered manually by the player.
+  const [customGoalAltitude, setCustomGoalAltitude] = useState<number | null>(null);
+
+  // Landing results: set when the rocket touches down, cleared on reset.
+  const [landingScore,      setLandingScore]      = useState<number | null>(null);
+  const [landingState,      setLandingState]      = useState<LandingState>(createLandingState());
+
+  // Trajectory history for the trajectory panel component.
+  const [trajectoryHistory, setTrajectoryHistory] = useState<Array<{ x: number; y: number }>>([]);
+
+  // Display copy of flight state — synced from flightStateRef every few frames.
+  // Used by overlay UI that needs flight data (landing modal, etc.).
+  const [displayFlightState, setDisplayFlightState] = useState<MultiStageRocketState>(
+    () => flightStateRef.current // Lazy initializer so it starts correct
   );
 
-  // Custom goal
-  const [customGoalAltitude, setCustomGoalAltitude] = useState<number | null>(
-    null
-  );
+  // Whether to show the debug performance stats panel (toggled by P key).
+  const [showPerfStats, setShowPerfStats] = useState<boolean>(DEBUG_MODE);
 
-  // Landing score
-  const [landingScore, setLandingScore] = useState<number | null>(null);
+  // Whether the fullscreen trajectory view is open.
+  const [showFullscreenTrajectory, setShowFullscreenTrajectory] = useState<boolean>(false);
 
-  // Fullscreen trajectory
-  const [showFullscreenTrajectory, setShowFullscreenTrajectory] =
-    useState(false);
+  // Audio UI state.
+  const [audioMuted,   setAudioMuted]   = useState<boolean>(false);
+  const [masterVolume, setMasterVolume] = useState<number>(0.5);
 
-  // Trajectory history
-  const [trajectoryHistory, setTrajectoryHistory] = useState<
-    Array<{ x: number; y: number }>
-  >([]);
+  // ── SYNC: React state → Refs ──────────────────────────────────────────────
+  // These tiny effects write updated React state values into the corresponding refs
+  // so the game loop (which only reads refs) always has current values without
+  // needing to be in the dependency array.
 
-  // Particle count
-  const [particleCount, setParticleCount] = useState(0);
+  // Sync effective time multiplier: 0 when paused, otherwise the selected multiplier.
+  useEffect(() => {
+    timeMultiplierRef.current = isPaused ? 0 : timeMultiplier;
+  }, [timeMultiplier, isPaused]); // Re-sync whenever either changes
 
-  // Landing mechanics
-  const [landingState, setLandingState] = useState<LandingState>(
-    createLandingState()
-  );
+  // Sync selected goal reference.
+  useEffect(() => {
+    selectedGoalRef.current = selectedGoal;
+  }, [selectedGoal]);
 
-  const [finalStageParachute, setFinalStageParachute] = useState<Parachute>(
-    createParachute(100000, 1)
-  );
+  // Sync custom goal altitude reference.
+  useEffect(() => {
+    customGoalAltitudeRef.current = customGoalAltitude;
+  }, [customGoalAltitude]);
 
-  const [landingGear, setLandingGear] = useState<LandingGear>(
-    createLandingGear(500000)
-  );
+  // Sync performance stats visibility reference.
+  useEffect(() => {
+    showPerfStatsRef.current = showPerfStats;
+  }, [showPerfStats]);
 
-  const parachuteDeployedRef = useRef(false);
+  // ── WINDOW RESIZE ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    // Update canvas size React state so the canvas element re-renders with new dimensions.
+    const handleResize = () => {
+      setCanvasWidth(window.innerWidth);   // New pixel width
+      setCanvasHeight(window.innerHeight); // New pixel height
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize); // Cleanup on unmount
+  }, []); // Only run once at mount — the handler itself reads window.inner* fresh each time
 
-  // Performance metrics
-  const [performanceMetrics, setPerformanceMetrics] = useState<PerformanceMetrics>(
-    performanceMonitorRef.current.getMetrics()
-  );
-
-  const [showPerformanceStats, setShowPerformanceStats] = useState(DEBUG_MODE);
-
-  // === NEW: AUDIO STATE ===
-
-  // Is audio muted?
-  const [audioMuted, setAudioMuted] = useState(false);
-
-  // Master volume (0-1)
-  const [masterVolume, setMasterVolume] = useState(0.5);
-
-  // === EVENT HANDLERS ===
-
-  /**
-   * Handle key press
-   */
-  const handleKeyDown = (e: KeyboardEvent) => {
-    keysPressed.current[e.key.toLowerCase()] = true;
-
-    // ESC closes fullscreen
-    if (e.key === "Escape") {
-      setShowFullscreenTrajectory(false);
+  // ── CANVAS DIMENSION EFFECT ────────────────────────────────────────────────
+  // When canvasWidth/Height React state changes, update the actual canvas DOM attributes.
+  // React re-renders the element but setting width/height as attributes clears the canvas
+  // and updates its rendering buffer size — this is how you resize an HTML canvas.
+  useEffect(() => {
+    if (canvasRef.current) {
+      canvasRef.current.width  = canvasWidth;  // Update drawing buffer width
+      canvasRef.current.height = canvasHeight; // Update drawing buffer height
     }
+  }, [canvasWidth, canvasHeight]);
 
-    // Spacebar doesn't scroll
-    if (e.key === " ") {
-      e.preventDefault();
-    }
+  // ── STAR FIELD GENERATION ────────────────────────────────────────────────────
+  // Generate 300 stars once at mount. Stored in a ref so the game loop
+  // can read them each frame without triggering re-renders.
+  useEffect(() => {
+    starsRef.current = generateStars(300); // 300 stars: enough density, not too many to draw
+  }, []); // Only generate once — star positions are random but fixed per session
 
-    // P toggles performance stats
-    if (e.key === "p" || e.key === "P") {
-      setShowPerformanceStats((prev) => !prev);
-    }
+  // ── KEYBOARD EVENT LISTENERS ──────────────────────────────────────────────
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Store both lowercase and original-case key so A=="a" and ArrowLeft=="arrowleft".
+      keysPressed.current[e.key] = true;             // Original key (e.g., "ArrowLeft")
+      keysPressed.current[e.key.toLowerCase()] = true; // Lowercase (e.g., "arrowleft")
 
-    // M toggles audio mute
-    if (e.key === "m" || e.key === "M") {
-      const newMuted = audioManagerRef.current.toggleMute();
-      setAudioMuted(newMuted);
-      audioManagerRef.current.playSound("ui-click");
-    }
-  };
+      // ── Time controls ──
+      if (e.key === "1") { setTimeMultiplier(1);  setIsPaused(false); } // 1× speed
+      else if (e.key === "2") { setTimeMultiplier(2);  setIsPaused(false); } // 2× speed
+      else if (e.key === "3") { setTimeMultiplier(5);  setIsPaused(false); } // 5× speed
+      else if (e.key === "4") { setTimeMultiplier(10); setIsPaused(false); } // 10× speed
+      else if (e.key === "0") { setIsPaused((p) => !p); } // Toggle pause
 
-  /**
-   * Handle key release
-   */
-  const handleKeyUp = (e: KeyboardEvent) => {
-    keysPressed.current[e.key.toLowerCase()] = false;
-  };
-
-  /**
-   * Handle canvas click
-   */
-  const handleCanvasClick = () => {
-    keysPressed.current["mouseClick"] = true;
-  };
-
-  /**
-   * Handle rocket selection with sound effect
-   */
-  const handleRocketChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const selectedName = e.target.value;
-
-    let selectedConfig: MultiStageRocketConfig | null = null;
-
-    if (selectedName === "Simple Two-Stage") {
-      selectedConfig = ROCKET_SIMPLE_TWO_STAGE;
-    } else if (selectedName === "Falcon 9 Inspired") {
-      selectedConfig = ROCKET_FALCON_9_INSPIRED;
-    } else if (selectedName === "Three-Stage Heavy") {
-      selectedConfig = ROCKET_THREE_STAGE;
-    }
-
-    if (selectedConfig) {
-      const newState = createMultiStageRocket(selectedConfig);
-      setFlightState(newState);
-      setRocketConfig(selectedConfig);
-      setLandingScore(null);
-      setTrajectoryHistory([]);
-
-      setLandingState(createLandingState());
-      setFinalStageParachute(createParachute(100000, 1));
-      setLandingGear(createLandingGear(500000));
-      parachuteDeployedRef.current = false;
-
-      performanceMonitorRef.current.reset();
-
-      particleSystemRef.current.clear();
-
-      // Play UI sound
-      audioManagerRef.current.playSound("ui-select");
-    }
-  };
-
-  /**
-   * Handle goal selection with sound
-   */
-  const handleGoalChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const goalName = e.target.value;
-    const goal = ALTITUDE_GOALS.find((g) => g.name === goalName);
-
-    if (goal) {
-      setSelectedGoal(goal);
-      setCustomGoalAltitude(null);
-      audioManagerRef.current.playSound("ui-select");
-    }
-  };
-
-  /**
-   * Handle custom goal input
-   */
-  const handleCustomGoal = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value;
-
-    if (value === "") {
-      setCustomGoalAltitude(null);
-      setSelectedGoal(ALTITUDE_GOALS[0]);
-    } else {
-      const altitude = parseFloat(value);
-      if (!isNaN(altitude) && altitude > 0) {
-        setCustomGoalAltitude(altitude);
-        setSelectedGoal(null);
+      // ── UI controls ──
+      if (e.key === "Escape") setShowFullscreenTrajectory(false); // Close fullscreen trajectory
+      if (e.key === " ")      e.preventDefault(); // Prevent SPACEBAR from scrolling the page
+      if (e.key === "p" || e.key === "P") setShowPerfStats((p) => !p); // Toggle perf stats
+      if (e.key === "m" || e.key === "M") { // Toggle audio mute
+        const muted = audioManagerRef.current.toggleMute();
+        setAudioMuted(muted);
+        audioManagerRef.current.playSound("ui-click");
       }
-    }
-  };
-
-  /**
-   * Handle reset button with sound
-   */
-  const handleReset = () => {
-    resetRocket(flightState, rocketConfig);
-    setFlightState({ ...flightState });
-    setLandingScore(null);
-    setShowFullscreenTrajectory(false);
-    setTrajectoryHistory([]);
-
-    setLandingState(createLandingState());
-    setFinalStageParachute(createParachute(100000, 1));
-    setLandingGear(createLandingGear(500000));
-    parachuteDeployedRef.current = false;
-
-    performanceMonitorRef.current.reset();
-
-    particleSystemRef.current.clear();
-
-    // Stop all audio and play click sound
-    audioManagerRef.current.stopAllSounds();
-    audioManagerRef.current.playSound("ui-click");
-
-    engineSoundPlayingRef.current = false;
-  };
-
-  /**
-   * Handle volume change
-   */
-  const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const volume = parseFloat(e.target.value);
-    setMasterVolume(volume);
-    audioManagerRef.current.setMasterVolume(volume);
-  };
-
-  // === DRAWING FUNCTIONS ===
-
-  /**
-   * Draw the ground
-   */
-  const drawGround = (ctx: CanvasRenderingContext2D) => {
-    const groundY = CANVAS_HEIGHT - 20;
-
-    ctx.fillStyle = COLORS.ground;
-    ctx.fillRect(0, groundY, CANVAS_WIDTH, 20);
-
-    ctx.strokeStyle = COLORS.text;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(0, groundY);
-    ctx.lineTo(CANVAS_WIDTH, groundY);
-    ctx.stroke();
-  };
-
-  /**
-   * Draw the rocket
-   */
-  const drawRocket = (ctx: CanvasRenderingContext2D, state: MultiStageRocketState) => {
-    const screenX = (CANVAS_WIDTH / 2) + (state.position.x * PIXELS_PER_METER);
-    const screenY = CANVAS_HEIGHT - 20 - (state.position.y * PIXELS_PER_METER);
-
-    let currentScreenY = screenY;
-
-    // Draw each stage
-    for (let i = 0; i < rocketConfig.stages.length; i++) {
-      const stage = rocketConfig.stages[i];
-
-      if (stage.isSeparated) continue;
-
-      const stageColor = `rgba(${200 - i * 40}, ${200 - i * 40}, ${200 - i * 40}, 1)`;
-      const stageHeight = 30 + i * 5;
-
-      ctx.fillStyle = stageColor;
-      ctx.fillRect(
-        screenX - ROCKET_BODY_WIDTH / 2,
-        currentScreenY - stageHeight,
-        ROCKET_BODY_WIDTH,
-        stageHeight
-      );
-
-      ctx.strokeStyle = COLORS.text;
-      ctx.lineWidth = 1;
-      ctx.strokeRect(
-        screenX - ROCKET_BODY_WIDTH / 2,
-        currentScreenY - stageHeight,
-        ROCKET_BODY_WIDTH,
-        stageHeight
-      );
-
-      // Fuel bar
-      const fuelPercent = (stage.fuelMass / stage.fuelCapacity) * 100;
-      const fuelBarWidth = (ROCKET_BODY_WIDTH - 4) * (fuelPercent / 100);
-      const fuelColor = fuelPercent > 20 ? "#00ff00" : "#ff4444";
-
-      ctx.fillStyle = fuelColor;
-      ctx.fillRect(
-        screenX - ROCKET_BODY_WIDTH / 2 + 2,
-        currentScreenY - stageHeight + 3,
-        fuelBarWidth,
-        stageHeight - 6
-      );
-
-      currentScreenY -= stageHeight;
-    }
-
-    // Nose cone
-    ctx.fillStyle = COLORS.rocketNose;
-    ctx.beginPath();
-    ctx.moveTo(screenX, currentScreenY - ROCKET_NOSE_HEIGHT);
-    ctx.lineTo(screenX - ROCKET_BODY_WIDTH / 2, currentScreenY);
-    ctx.lineTo(screenX + ROCKET_BODY_WIDTH / 2, currentScreenY);
-    ctx.closePath();
-    ctx.fill();
-
-    // Flame
-    const activeStage = rocketConfig.stages.find((s) => s.isActive && !s.isSeparated);
-    if (activeStage && activeStage.isThrusting && activeStage.fuelMass > 0) {
-      const flameHeight =
-        ROCKET_FLAME_HEIGHT_MIN +
-        ((ROCKET_FLAME_HEIGHT_MAX - ROCKET_FLAME_HEIGHT_MIN) *
-          (activeStage.thrustPercentage / 100));
-
-      const flameBaseY = screenY;
-
-      ctx.fillStyle = COLORS.flame;
-      ctx.beginPath();
-      ctx.moveTo(screenX, flameBaseY);
-      ctx.lineTo(screenX - ROCKET_BODY_WIDTH / 1.5, flameBaseY + flameHeight);
-      ctx.lineTo(screenX + ROCKET_BODY_WIDTH / 1.5, flameBaseY + flameHeight);
-      ctx.closePath();
-      ctx.fill();
-
-      ctx.fillStyle = "rgba(255, 200, 0, 0.7)";
-      ctx.beginPath();
-      ctx.moveTo(screenX, flameBaseY);
-      ctx.lineTo(screenX - ROCKET_BODY_WIDTH / 2.5, flameBaseY + flameHeight * 0.6);
-      ctx.lineTo(screenX + ROCKET_BODY_WIDTH / 2.5, flameBaseY + flameHeight * 0.6);
-      ctx.closePath();
-      ctx.fill();
-    }
-
-    // Parachute
-    if (finalStageParachute.isDeployed && finalStageParachute.deploymentProgress > 0) {
-      const parachuteRadius = 20 * finalStageParachute.deploymentProgress;
-      const parachuteY = currentScreenY - 40 - parachuteRadius;
-
-      ctx.fillStyle = "rgba(255, 100, 100, 0.6)";
-      ctx.beginPath();
-      ctx.arc(screenX, parachuteY, parachuteRadius, Math.PI, 0);
-      ctx.fill();
-
-      ctx.strokeStyle = "rgba(255, 100, 100, 1)";
-      ctx.lineWidth = 1;
-      ctx.stroke();
-
-      for (let line = 0; line < 4; line++) {
-        const angle = (Math.PI / 3) + (line * Math.PI / 6);
-        const attachX = screenX + parachuteRadius * Math.cos(angle);
-        const attachY = parachuteY + parachuteRadius * Math.sin(angle);
-
-        ctx.strokeStyle = "rgba(255, 100, 100, 0.5)";
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(attachX, attachY);
-        ctx.lineTo(screenX, currentScreenY);
-        ctx.stroke();
-      }
-    }
-
-    // Landing gear
-    if (flightState.position.y <= 1) {
-      let gearColor = "#00ff00";
-      if (landingGear.damageState > 0.5) {
-        gearColor = "#ffff00";
-      }
-      if (landingGear.isBroken) {
-        gearColor = "#ff0000";
-      }
-
-      ctx.strokeStyle = gearColor;
-      ctx.lineWidth = 2;
-
-      ctx.beginPath();
-      ctx.moveTo(screenX - ROCKET_BODY_WIDTH / 2, screenY);
-      ctx.lineTo(screenX - ROCKET_BODY_WIDTH - 10, screenY + 15);
-      ctx.stroke();
-
-      ctx.beginPath();
-      ctx.moveTo(screenX + ROCKET_BODY_WIDTH / 2, screenY);
-      ctx.lineTo(screenX + ROCKET_BODY_WIDTH + 10, screenY + 15);
-      ctx.stroke();
-    }
-  };
-
-  /**
-   * Draw telemetry panel
-   */
-  const drawInfoPanel = (ctx: CanvasRenderingContext2D, state: MultiStageRocketState) => {
-    const panelX = CANVAS_WIDTH - INFO_PANEL_WIDTH - INFO_PANEL_MARGIN;
-    const panelY = CANVAS_HEIGHT - INFO_PANEL_HEIGHT - INFO_PANEL_MARGIN;
-
-    ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
-    ctx.fillRect(panelX, panelY, INFO_PANEL_WIDTH, INFO_PANEL_HEIGHT);
-
-    ctx.strokeStyle = COLORS.ui;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(panelX, panelY, INFO_PANEL_WIDTH, INFO_PANEL_HEIGHT);
-
-    ctx.fillStyle = COLORS.text;
-    ctx.font = `${FONT_SIZE_SMALL}px monospace`;
-
-    const drawLine = (text: string, yOffset: number) => {
-      ctx.fillText(text, panelX + 10, panelY + 25 + yOffset);
     };
 
-    let lineOffset = 0;
-    const lineHeight = 20;
-
-    ctx.font = `bold ${FONT_SIZE_MEDIUM}px monospace`;
-    drawLine("TELEMETRY", lineOffset);
-    ctx.font = `${FONT_SIZE_SMALL}px monospace`;
-    lineOffset += lineHeight + 5;
-
-    ctx.strokeStyle = COLORS.ui;
-    ctx.beginPath();
-    ctx.moveTo(panelX + 10, panelY + 35);
-    ctx.lineTo(panelX + INFO_PANEL_WIDTH - 10, panelY + 35);
-    ctx.stroke();
-    lineOffset += 10;
-
-    const altitudeDisplay =
-      state.maxAltitudeReached > 100000
-        ? (state.maxAltitudeReached / 1000).toFixed(0) + " km"
-        : state.maxAltitudeReached.toFixed(0) + " m";
-    drawLine(`ALT: ${altitudeDisplay}`, lineOffset);
-    lineOffset += lineHeight;
-
-    const currentAlt =
-      state.position.y > 100000
-        ? (state.position.y / 1000).toFixed(1) + " km"
-        : state.position.y.toFixed(1) + " m";
-    drawLine(`CUR: ${currentAlt}`, lineOffset);
-    lineOffset += lineHeight;
-
-    drawLine(`VEL: ${state.velocity.y.toFixed(1)} m/s`, lineOffset);
-    lineOffset += lineHeight;
-
-    let totalFuel = 0;
-    let totalCapacity = 0;
-    for (const stage of rocketConfig.stages) {
-      if (!stage.isSeparated) {
-        totalFuel += stage.fuelMass;
-        totalCapacity += stage.fuelCapacity;
-      }
-    }
-    const totalFuelPercent = totalCapacity > 0 ? (totalFuel / totalCapacity) * 100 : 0;
-    drawLine(`FUEL: ${totalFuelPercent.toFixed(0)}%`, lineOffset);
-    lineOffset += lineHeight;
-
-    const activeStage = rocketConfig.stages.find((s) => s.isActive && !s.isSeparated);
-    const throttleDisplay = activeStage ? activeStage.thrustPercentage.toFixed(0) : "0";
-    drawLine(`THR: ${throttleDisplay}%`, lineOffset);
-    lineOffset += lineHeight;
-
-    const minutes = Math.floor(state.timeElapsed / 60);
-    const seconds = (state.timeElapsed % 60).toFixed(1);
-    drawLine(`TIME: ${minutes}:${seconds}`, lineOffset);
-    lineOffset += lineHeight;
-
-    let status = "STANDBY";
-    if (state.isFlying) status = "FLYING";
-    if (state.hasLanded) status = "LANDED";
-    drawLine(`STATUS: ${status}`, lineOffset);
-    lineOffset += lineHeight;
-
-    drawLine(`STAGE: ${state.activeStageNumber + 1}/${rocketConfig.stages.length}`, lineOffset);
-    lineOffset += lineHeight;
-
-    if (state.stageSeparationCount > 0) {
-      drawLine(`SEPARATED: ${state.stageSeparationCount}`, lineOffset);
-    }
-  };
-
-  /**
-   * Draw performance stats
-   */
-  const drawPerformanceStats = (ctx: CanvasRenderingContext2D, metrics: PerformanceMetrics) => {
-    const panelX = 10;
-    const panelY = 10;
-    const panelWidth = 280;
-    const panelHeight = 200;
-
-    ctx.fillStyle = "rgba(0, 0, 0, 0.8)";
-    ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
-
-    const perfStatus = getPerformanceStatus(metrics);
-    ctx.strokeStyle = perfStatus.color;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(panelX, panelY, panelWidth, panelHeight);
-
-    ctx.fillStyle = perfStatus.color;
-    ctx.font = `bold ${FONT_SIZE_SMALL}px monospace`;
-
-    const drawLine = (text: string, yOffset: number) => {
-      ctx.fillText(text, panelX + 10, panelY + 20 + yOffset);
+    const handleKeyUp = (e: KeyboardEvent) => {
+      // Release both original and lowercase entries so steering stops when key is lifted.
+      keysPressed.current[e.key] = false;
+      keysPressed.current[e.key.toLowerCase()] = false;
     };
 
-    let lineOffset = 0;
-    const lineHeight = 18;
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup",   handleKeyUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup",   handleKeyUp);
+    };
+  }, []); // Only attach once — handler reads refs dynamically, no stale values
 
-    drawLine(`${perfStatus.emoji} ${perfStatus.status}`, lineOffset);
-    lineOffset += lineHeight + 3;
-
-    ctx.fillStyle = COLORS.text;
-    ctx.font = `${FONT_SIZE_SMALL}px monospace`;
-
-    drawLine(`FPS: ${metrics.framesPerSecond.toFixed(0)}`, lineOffset);
-    lineOffset += lineHeight;
-
-    drawLine(`Frame: ${metrics.frameTime.toFixed(1)}ms`, lineOffset);
-    lineOffset += lineHeight;
-
-    drawLine(`Physics: ${metrics.physicsTime.toFixed(1)}ms`, lineOffset);
-    lineOffset += lineHeight;
-
-    drawLine(`Render: ${metrics.renderTime.toFixed(1)}ms`, lineOffset);
-    lineOffset += lineHeight;
-
-    drawLine(`Particles: ${metrics.particleCount}/${metrics.maxParticles}`, lineOffset);
-    lineOffset += lineHeight;
-
-    drawLine(`Trajectory: ${metrics.trajectoryPointCount}`, lineOffset);
-    lineOffset += lineHeight;
-
-    drawLine(`Memory: ${metrics.trajectoryMemoryMB.toFixed(1)}MB`, lineOffset);
-    lineOffset += lineHeight;
-
-    drawLine(`Health: ${metrics.healthScore.toFixed(0)}/100`, lineOffset);
-
-    if (metrics.warnings.length > 0) {
-      lineOffset += lineHeight + 2;
-      ctx.fillStyle = "#ffff00";
-      ctx.font = `${FONT_SIZE_SMALL - 2}px monospace`;
-      for (let i = 0; i < Math.min(2, metrics.warnings.length); i++) {
-        drawLine(metrics.warnings[i].substring(0, 25), lineOffset);
-        lineOffset += lineHeight - 3;
-      }
-    }
-  };
-
-  // === GAME LOOP ===
-
-  /**
-   * Main game loop with audio integration
-   */
+  // ── MAIN GAME LOOP ─────────────────────────────────────────────────────────
+  // Runs ONCE on mount (empty dependency array).
+  // All game data is accessed via refs — no stale closures.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    let lastFrameTime = Date.now();
+    let lastFrameTime = performance.now(); // Timestamp of the previous frame (ms)
+    let frameCount = 0;                    // Total frames rendered since loop start
 
     const gameLoop = () => {
-      // Start timing
-      performanceMonitorRef.current.startFrame();
+      frameCount++; // Increment global frame counter
+      performanceMonitorRef.current.startFrame(); // Start perf measurement for this frame
 
-      const now = Date.now();
-      const deltaTime = Math.min((now - lastFrameTime) / 1000, 0.1);
+      // Compute wall-clock time since last frame, capped at 0.1 s.
+      // The cap prevents a "spiral of death" if the tab was backgrounded for several seconds:
+      // without the cap, one giant Δt would send the rocket flying impossibly fast.
+      const now = performance.now();
+      const rawDelta = Math.min((now - lastFrameTime) / 1000, 0.1); // Seconds, max 0.1 s
       lastFrameTime = now;
 
-      // === APPLY CONTROLS ===
-      const isSpacebarPressed = keysPressed.current[" "];
-      const isClickActive = keysPressed.current["mouseClick"] || false;
+      // Read the current canvas dimensions (may have changed via resize).
+      const cw = canvas.width;
+      const ch = canvas.height;
 
-      applyControls(rocketConfig, isSpacebarPressed, isClickActive);
-      keysPressed.current["mouseClick"] = false;
+      // ── TIME MULTIPLIER ──────────────────────────────────────────────────
+      // effectiveMult is 0 when paused (no physics), 1-10 otherwise.
+      const effectiveMult = timeMultiplierRef.current;
+      // Game-time delta: how much simulated time passes this frame.
+      const gameDelta = rawDelta * effectiveMult;
 
-      // === PHYSICS UPDATE ===
-      performanceMonitorRef.current.startPhysicsTimer();
+      // ── PHYSICS SUB-STEPPING ────────────────────────────────────────────
+      // At high time multipliers we run multiple physics ticks per frame.
+      // Each tick uses rawDelta (real-time step), so the total game time per
+      // frame is rawDelta × subSteps = gameDelta.
+      //
+      // WHY SUB-STEPPING?
+      //   At 10× speed, one giant Δt = 0.16 s per frame. With fast acceleration
+      //   and small objects, the rocket could pass through the ground in a single
+      //   step (numerical tunneling). 10 sub-steps of 0.016 s each are safer.
+      const subSteps = effectiveMult > 0 ? Math.max(1, Math.round(effectiveMult)) : 0;
+      // subDelta: time per physics sub-step.
+      const subDelta = subSteps > 0 ? gameDelta / subSteps : 0;
 
-      const physicsFrame = updatePhysics(flightState, rocketConfig, {
-        gravity: GRAVITY,
-        windSpeed: WIND_SPEED,
-        dragCoefficient: DRAG_COEFFICIENT,
-        rocketRadius: ROCKET_RADIUS,
-        timeStep: PHYSICS_TICK_RATE,
-      }, deltaTime);
+      // Run all sub-steps this frame.
+      for (let step = 0; step < subSteps; step++) {
+        const state  = flightStateRef.current;  // Current flight state (ref — always fresh)
+        const config = rocketConfigRef.current; // Current rocket config (ref — always fresh)
 
-      performanceMonitorRef.current.endPhysicsTimer();
+        // ── READ KEYS ────────────────────────────────────────────────────
+        const spacebar  = keysPressed.current[" "] ?? false;       // Thrust
+        const clickBurst = keysPressed.current["mouseClick"] ?? false; // Click burst
+        const tiltLeft  = (keysPressed.current["a"] ?? false) ||
+                          (keysPressed.current["arrowleft"] ?? false); // Steer left
+        const tiltRight = (keysPressed.current["d"] ?? false) ||
+                          (keysPressed.current["arrowright"] ?? false); // Steer right
 
-      // === AUDIO: ENGINE SOUND ===
-      // Play/update engine thrust sound based on throttle
-      const activeStage = rocketConfig.stages.find((s) => s.isActive && !s.isSeparated);
-      const currentThrottle = activeStage ? activeStage.thrustPercentage : 0;
+        // ── APPLY CONTROLS ───────────────────────────────────────────────
+        // Throttle ramp + angular velocity change from steering input.
+        applyControls(config, state, spacebar, clickBurst, tiltLeft, tiltRight, subDelta);
 
-      // Throttle up sound
-      if (currentThrottle > previousThrottleRef.current && currentThrottle > 0 && previousThrottleRef.current === 0) {
-        audioManagerRef.current.playSound("engine-ignition");
-      }
+        // Clear mouse-click flag after the first sub-step — it's a one-shot event,
+        // not a held state. Consuming it on step 0 prevents applying it 10 times at 10×.
+        if (step === 0) keysPressed.current["mouseClick"] = false;
 
-      // Throttle increase sound
-      if (currentThrottle > previousThrottleRef.current + 10) {
-        audioManagerRef.current.playSound("thrust-increase");
-      }
+        // ── PHYSICS UPDATE ───────────────────────────────────────────────
+        performanceMonitorRef.current.startPhysicsTimer();
+        const frame = updatePhysics(
+          state,
+          config,
+          {
+            gravity:           GRAVITY,           // 9.81 m/s²
+            windSpeed:         WIND_SPEED,         // {x: 3, y: 0} light breeze
+            dragCoefficient:   DRAG_COEFFICIENT,   // 0.1
+            rocketRadius:      ROCKET_RADIUS,       // 0.5 m
+            timeStep:          PHYSICS_TICK_RATE,   // 60 Hz target rate
+          },
+          subDelta
+        );
+        performanceMonitorRef.current.endPhysicsTimer();
 
-      // Throttle decrease sound
-      if (currentThrottle < previousThrottleRef.current - 10) {
-        audioManagerRef.current.playSound("thrust-decrease");
-      }
+        // ── AUDIO: ENGINE SOUNDS (only on first sub-step to avoid sound spam) ──
+        if (step === 0) {
+          const activeStg  = config.stages.find((s) => s.isActive && !s.isSeparated);
+          const throttle   = activeStg ? activeStg.thrustPercentage : 0;
 
-      // Continuous engine sound
-      if (currentThrottle > 0 && flightState.isFlying) {
-        if (!engineSoundPlayingRef.current) {
-          audioManagerRef.current.playSound("engine-thrust", {
-            loop: true,
-            pitch: 0.8 + (currentThrottle / 100) * 0.4, // Pitch varies with throttle
-          });
-          engineSoundPlayingRef.current = true;
+          // Engine ignition: rising from 0 to >0 throttle.
+          if (throttle > 0 && previousThrottleRef.current === 0) {
+            audioManagerRef.current.playSound("engine-ignition");
+          }
+          // Throttle-up click: throttle increased by more than 10% since last frame.
+          if (throttle > previousThrottleRef.current + 10) {
+            audioManagerRef.current.playSound("thrust-increase");
+          }
+          // Throttle-down click: throttle dropped by more than 10%.
+          if (throttle < previousThrottleRef.current - 10) {
+            audioManagerRef.current.playSound("thrust-decrease");
+          }
+          // Continuous engine sound while flying and thrusting.
+          if (throttle > 0 && frame.state.isFlying) {
+            if (!engineSoundPlayingRef.current) {
+              audioManagerRef.current.playSound("engine-thrust", {
+                loop:  true,
+                pitch: 0.8 + (throttle / 100) * 0.4, // Higher pitch at higher throttle
+              });
+              engineSoundPlayingRef.current = true;
+            }
+          } else {
+            if (engineSoundPlayingRef.current) {
+              audioManagerRef.current.stopSound("engine-thrust");
+              engineSoundPlayingRef.current = false;
+            }
+          }
+          previousThrottleRef.current = throttle; // Remember for next frame
         }
-      } else {
-        if (engineSoundPlayingRef.current) {
+
+        // ── PARACHUTE ───────────────────────────────────────────────────
+        // Auto-deploy when descending fast above minimum altitude (first time only).
+        if (
+          frame.state.isFlying &&
+          !parachuteDeployedRef.current &&
+          frame.state.velocity.y < -5 &&   // Moving downward at > 5 m/s
+          frame.state.position.y > parachuteRef.current.minAltitudeForDeployment
+        ) {
+          deployParachute(parachuteRef.current); // Start parachute inflation
+          parachuteDeployedRef.current = true;  // Only deploy once
+          audioManagerRef.current.playSound("parachute-deploy");
+        }
+        updateParachute(parachuteRef.current, subDelta); // Inflate over time
+
+        // ── STAGE SEPARATION EFFECTS ─────────────────────────────────────
+        if (frame.state.didStageSeperateThisFrame) {
+          // Burst of orange particles at separation point.
+          particleSystemRef.current.createBurst(
+            frame.state.position.x,
+            frame.state.position.y,
+            20,                          // 20 particles
+            "rgba(255, 200, 100, 1)",    // Orange-yellow burst color
+            40                           // 40 m/s max outward speed
+          );
+          sepShakeTimerRef.current = 0.5; // Stage shake lasts 0.5 real seconds
+          cameraRef.current.addShake(5);  // Immediate 5-pixel camera jolt
+          if (step === 0) audioManagerRef.current.playSound("stage-separation");
+        }
+
+        // ── LANDING DETECTION ────────────────────────────────────────────
+        if (frame.groundImpact && !landingStateRef.current.hasTouchedDown) {
+          // Process landing: compute damage, quality, score.
+          const updatedLanding = processLanding(
+            landingStateRef.current,
+            frame.state.landingVelocity,
+            1000, // Rocket mass estimate for damage calculation
+            landingGearRef.current,
+            parachuteRef.current.hasBeenUsed ? 1 : 0
+          );
+          landingStateRef.current = updatedLanding;
+
+          const score = calculateLandingScore(frame.state.landingVelocity);
+
+          // Sync landing results to React state (triggers UI re-render for landing modal).
+          setLandingScore(score);
+          setLandingState({ ...updatedLanding });
+
+          // Landing visual effects.
+          if (score > 50) {
+            // Soft landing: small dust puff.
+            particleSystemRef.current.createBurst(frame.state.position.x, 0, 5, "rgba(200,200,200,0.8)", 8);
+            audioManagerRef.current.playSound("landing-soft");
+          } else {
+            // Hard landing / crash: big explosion burst.
+            particleSystemRef.current.createBurst(frame.state.position.x, 0, 20, "rgba(255,80,0,1)", 30);
+            audioManagerRef.current.playSound("landing-hard");
+          }
           audioManagerRef.current.stopSound("engine-thrust");
           engineSoundPlayingRef.current = false;
         }
-      }
 
-      previousThrottleRef.current = currentThrottle;
+        // Update the flight state ref with the result of this physics sub-step.
+        flightStateRef.current = frame.state;
+      } // END physics sub-steps
 
-      // === PARACHUTE DEPLOYMENT ===
-      if (
-        flightState.isFlying &&
-        !parachuteDeployedRef.current &&
-        physicsFrame.state.velocity.y < -5 &&
-        physicsFrame.state.position.y > finalStageParachute.minAltitudeForDeployment
-      ) {
-        deployParachute(finalStageParachute);
-        parachuteDeployedRef.current = true;
-        audioManagerRef.current.playSound("parachute-deploy");
-      }
-
-      const parachtuteDragForce = updateParachute(finalStageParachute, deltaTime);
-
-      if (parachtuteDragForce > 0) {
-        const totalMass = flightState.maxAltitudeReached > 0 ? 1000 : 1;
-        const parachtuteDragAcceleration = parachtuteDragForce / totalMass;
-        physicsFrame.state.acceleration.y += parachtuteDragAcceleration;
-      }
-
-      // === STAGE SEPARATION ===
-      if (physicsFrame.state.didStageSeperateThisFrame) {
-        particleSystemRef.current.createBurst(
-          physicsFrame.state.position.x,
-          physicsFrame.state.position.y,
-          20,
-          "rgba(255, 200, 100, 1)",
-          40
-        );
-        audioManagerRef.current.playSound("stage-separation");
-      }
-
-      // === EXHAUST TRAIL ===
+      // ── PARTICLES ────────────────────────────────────────────────────────
+      // Spawn exhaust particles at REAL time rate (not game-time rate).
+      // At 10× speed we don't want 10× the particles — cap spawn via probability.
+      const activeStage = rocketConfigRef.current.stages.find(
+        (s) => s.isActive && !s.isSeparated
+      );
       if (activeStage && activeStage.isThrusting && activeStage.fuelMass > 0) {
-        particleSystemRef.current.createExhaustTrail(
-          physicsFrame.state.position.x,
-          physicsFrame.state.position.y,
-          physicsFrame.state.velocity.x,
-          physicsFrame.state.velocity.y,
-          activeStage.thrustPercentage
-        );
-      }
-
-      particleSystemRef.current.update(deltaTime);
-      setParticleCount(particleSystemRef.current.getParticleCount());
-
-      // === LANDING ===
-      if (physicsFrame.groundImpact && !landingState.hasTouchedDown) {
-        const updatedLandingState = processLanding(
-          landingState,
-          physicsFrame.state.landingVelocity,
-          1000,
-          landingGear,
-          finalStageParachute.hasBeenUsed ? 1 : 0
-        );
-
-        setLandingState(updatedLandingState);
-
-        const score = calculateLandingScore(physicsFrame.state.landingVelocity);
-        setLandingScore(score);
-
-        // Play landing sound based on impact
-        if (score > 50) {
-          particleSystemRef.current.createBurst(
-            physicsFrame.state.position.x,
-            0,
-            5,
-            "rgba(200, 200, 200, 1)",
-            10
+        // spawnChance: 1.0 at 1× speed, 0.1 at 10× speed — inversely proportional.
+        const spawnChance = Math.min(1, 1 / Math.max(1, effectiveMult));
+        if (Math.random() < spawnChance) {
+          // Spawn exhaust at the rocket's current position in WORLD SPACE.
+          particleSystemRef.current.createExhaustTrail(
+            flightStateRef.current.position.x,
+            flightStateRef.current.position.y,
+            flightStateRef.current.velocity.x,
+            flightStateRef.current.velocity.y,
+            flightStateRef.current.angle,       // NEW: angle so exhaust comes from the nozzle
+            activeStage.thrustPercentage
           );
-          audioManagerRef.current.playSound("landing-soft");
-        } else {
-          particleSystemRef.current.createBurst(
-            physicsFrame.state.position.x,
-            0,
-            15,
-            "rgba(255, 100, 0, 1)",
-            30
-          );
-          audioManagerRef.current.playSound("landing-hard");
         }
-
-        audioManagerRef.current.stopSound("engine-thrust");
-        engineSoundPlayingRef.current = false;
       }
 
-      // === TRAJECTORY ===
-      const newPoint = { x: physicsFrame.state.position.x, y: physicsFrame.state.position.y };
+      // Update particles at REAL time speed (rawDelta), not game time.
+      // Particles are visual — they should always fade at wall-clock speed.
+      particleSystemRef.current.update(rawDelta);
 
-      setTrajectoryHistory((prev) => {
-        const updated = [...prev, newPoint];
-        return trajectoryLimiterRef.current.limitTrajectory(updated);
-      });
+      // ── CAMERA UPDATE ──────────────────────────────────────────────────
+      const state = flightStateRef.current;
+      const camera = cameraRef.current;
 
-      setFlightState({ ...physicsFrame.state });
+      // Tell camera to follow the rocket's current position.
+      camera.setTarget(state.position.x, state.position.y);
 
-      // === RENDERING ===
+      // Set camera zoom based on current altitude.
+      camera.setTargetZoom(state.position.y);
+
+      // Engine vibration shake: subtle above 50% throttle.
+      if (activeStage && activeStage.thrustPercentage > 50) {
+        // Intensity: 0 px at 50% throttle, up to 2 px at 100% throttle.
+        const shakeIntensity = ((activeStage.thrustPercentage - 50) / 50) * 2;
+        camera.addShake(shakeIntensity);
+      }
+
+      // Stage-separation shake: persist the jolt for 0.5 real seconds.
+      if (sepShakeTimerRef.current > 0) {
+        sepShakeTimerRef.current -= rawDelta; // Countdown in real seconds
+        camera.addShake(4); // Strong shake during countdown
+      }
+
+      // Smooth zoom back to normal after landing.
+      if (state.hasLanded) {
+        camera.setTargetZoom(0); // Target zoom=1.0 (ground level)
+        // Also re-target to rocket's landing position so camera doesn't drift.
+        camera.setTarget(state.position.x, 0);
+      }
+
+      camera.update(rawDelta); // Lerp position/zoom, decay shake
+
+      // ── RENDER ────────────────────────────────────────────────────────────
       performanceMonitorRef.current.startRenderTimer();
 
-      ctx.fillStyle = COLORS.background;
-      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      ctx.clearRect(0, 0, cw, ch); // Clear previous frame
 
-      particleSystemRef.current.draw(
-        ctx,
-        PIXELS_PER_METER,
-        CANVAS_WIDTH,
-        CANVAS_HEIGHT
+      // 1. Sky gradient (changes color with altitude).
+      drawBackground(ctx, cw, ch, state.position.y);
+
+      // 2. Parallax star field (only visible above ~5 km).
+      drawStars(ctx, starsRef.current, cw, ch, camera, state.position.y);
+
+      // 3. Ground surface line at world Y=0.
+      drawGround(ctx, cw, ch, camera);
+
+      // 4. Exhaust particles and stage-separation burst.
+      particleSystemRef.current.draw(ctx, camera, cw, ch);
+
+      // 5. Goal altitude indicator line.
+      const goalAlt  = customGoalAltitudeRef.current ?? selectedGoalRef.current?.altitude ?? 0;
+      const goalName = customGoalAltitudeRef.current
+        ? "Custom"
+        : (selectedGoalRef.current?.name ?? "");
+      if (goalAlt > 0) drawGoalLine(ctx, cw, ch, camera, goalAlt, goalName);
+
+      // 6. Rocket body (camera-transformed, angle-rotated, detailed visual).
+      drawRocket(
+        ctx, cw, ch, camera, state,
+        rocketConfigRef.current,
+        parachuteRef.current,
+        landingGearRef.current
       );
 
-      drawGround(ctx);
-      drawRocket(ctx, flightState);
-      drawInfoPanel(ctx, flightState);
+      // 7. Telemetry HUD (bottom-right canvas overlay).
+      const activeMult = isPausedRef.current ? 0 : timeMultiplierRef.current;
+      drawTelemetry(ctx, cw, ch, state, rocketConfigRef.current, activeMult, isPausedRef.current);
 
-      // Goal indicator
-      if (selectedGoal || customGoalAltitude) {
-        const goalAlt = customGoalAltitude || selectedGoal?.altitude || 0;
-        const goalScreenY = CANVAS_HEIGHT - 20 - (goalAlt * PIXELS_PER_METER);
-
-        if (goalScreenY > 0 && goalScreenY < CANVAS_HEIGHT) {
-          ctx.strokeStyle = COLORS.trajectory;
-          ctx.lineWidth = 2;
-          ctx.setLineDash([5, 5]);
-          ctx.beginPath();
-          ctx.moveTo(0, goalScreenY);
-          ctx.lineTo(CANVAS_WIDTH, goalScreenY);
-          ctx.stroke();
-          ctx.setLineDash([]);
-
-          ctx.fillStyle = COLORS.trajectory;
-          ctx.font = `${FONT_SIZE_SMALL}px monospace`;
-          ctx.fillText(
-            `Goal: ${(selectedGoal?.name || "Custom")} (${(goalAlt / 1000).toFixed(0)}km)`,
-            10,
-            goalScreenY - 5
-          );
-        }
+      // 8. Debug performance panel (top-left, toggle with P key).
+      if (showPerfStatsRef.current) {
+        drawPerfStats(ctx, performanceMonitorRef.current.getMetrics());
       }
 
       performanceMonitorRef.current.endRenderTimer();
-
       performanceMonitorRef.current.setParticleCount(particleSystemRef.current.getParticleCount());
-      performanceMonitorRef.current.setTrajectoryPointCount(trajectoryHistory.length);
+      performanceMonitorRef.current.setTrajectoryPointCount(trajectoryBufferRef.current.length);
       performanceMonitorRef.current.endFrame();
 
-      setPerformanceMetrics(performanceMonitorRef.current.getMetrics());
+      // ── SYNC TO REACT STATE (every 3 frames to reduce re-renders) ──────────
+      if (frameCount % 3 === 0) {
+        // Copy flight state to React state for overlay UI (landing modal, etc.).
+        setDisplayFlightState({ ...flightStateRef.current });
 
-      if (showPerformanceStats) {
-        drawPerformanceStats(ctx, performanceMonitorRef.current.getMetrics());
       }
 
-      animationFrameRef.current = requestAnimationFrame(gameLoop);
-    };
+      // ── TRAJECTORY BUFFER ────────────────────────────────────────────────
+      // Append current position to the raw buffer every frame.
+      trajectoryBufferRef.current.push({
+        x: state.position.x,
+        y: state.position.y,
+      });
 
+      // Sync trajectory buffer to React state every 10 frames.
+      // TrajectoryPanel reads from React state, so we need periodic syncs.
+      if (frameCount % 10 === 0) {
+        const limited = trajectoryLimiterRef.current.limitTrajectory(
+          [...trajectoryBufferRef.current] // Pass a copy — limiter may truncate
+        );
+        setTrajectoryHistory(limited);
+      }
+
+      // Schedule next frame via rAF.
+      animationFrameRef.current = requestAnimationFrame(gameLoop);
+    }; // END gameLoop
+
+    // Kick off the loop.
     animationFrameRef.current = requestAnimationFrame(gameLoop);
 
+    // Cleanup: cancel the rAF when the component unmounts.
     return () => {
-      if (animationFrameRef.current) {
+      if (animationFrameRef.current !== null) {
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [flightState, rocketConfig, selectedGoal, customGoalAltitude, landingScore, landingState, showPerformanceStats]);
+  }, []); // EMPTY DEPS — game loop runs once and reads all values from refs
 
-  // === EVENT LISTENERS ===
+  // ── EVENT HANDLERS (React UI) ─────────────────────────────────────────────
 
-  useEffect(() => {
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
+  /** Reset the simulation to the pre-launch state. */
+  const handleReset = useCallback(() => {
+    // Clone the current rocket config fresh so all tanks are full again.
+    const freshConfig = cloneRocketConfig(rocketConfigRef.current);
+    resetAllStages(freshConfig); // Ensure all stages are reset to initial state
 
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
-    };
+    // Update the physics-active config ref immediately (the game loop will see this next tick).
+    rocketConfigRef.current = freshConfig;
+
+    // Reset flight state: back to ground, no velocity, no rotation.
+    const freshState = createMultiStageRocket(freshConfig);
+    flightStateRef.current = freshState;
+
+    // Sync fresh state to React for UI display.
+    setDisplayFlightState({ ...freshState });
+    setRocketConfig(freshConfig); // Update React state so the select box label stays correct
+
+    // Reset landing state.
+    landingStateRef.current = createLandingState();
+    parachuteRef.current = createParachute(100000, 1); // New parachute (not used)
+    landingGearRef.current = createLandingGear(500000); // Fresh gear
+    parachuteDeployedRef.current = false; // Allow parachute deployment on new flight
+
+    // Snap camera back to ground.
+    cameraRef.current.reset();
+
+    // Clear trajectory.
+    trajectoryBufferRef.current = [];
+    setTrajectoryHistory([]);
+    setLandingScore(null);
+    setLandingState(createLandingState());
+
+    // Clear particles (no leftover exhaust from previous flight).
+    particleSystemRef.current.clear();
+
+    // Stop all audio and play a click confirmation.
+    audioManagerRef.current.stopAllSounds();
+    audioManagerRef.current.playSound("ui-click");
+    engineSoundPlayingRef.current = false;
+
+    // Reset performance monitor stats.
+    performanceMonitorRef.current.reset();
+    setShowFullscreenTrajectory(false);
+  }, []); // No deps — all game data accessed via refs
+
+  /** Switch to a different rocket type. */
+  const handleRocketChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
+    const name = e.target.value;
+
+    // Find the selected config constant.
+    let baseConfig: MultiStageRocketConfig | null = null;
+    if (name === "Simple Two-Stage")   baseConfig = ROCKET_SIMPLE_TWO_STAGE;
+    if (name === "Falcon 9 Inspired")  baseConfig = ROCKET_FALCON_9_INSPIRED;
+    if (name === "Three-Stage Heavy")  baseConfig = ROCKET_THREE_STAGE;
+    if (!baseConfig) return;
+
+    // Clone it so mutations don't corrupt the exported constants.
+    const freshConfig = cloneRocketConfig(baseConfig);
+    resetAllStages(freshConfig); // Ensure full tanks
+
+    // Update physics ref and React state.
+    rocketConfigRef.current = freshConfig;
+    setRocketConfig(freshConfig);
+
+    // Create a fresh flight state for the new rocket.
+    const freshState = createMultiStageRocket(freshConfig);
+    flightStateRef.current = freshState;
+    setDisplayFlightState({ ...freshState });
+
+    // Reset landing mechanics for the new rocket.
+    landingStateRef.current = createLandingState();
+    parachuteRef.current = createParachute(100000, 1);
+    landingGearRef.current = createLandingGear(500000);
+    parachuteDeployedRef.current = false;
+
+    // Clear old trajectory and landing results.
+    trajectoryBufferRef.current = [];
+    setTrajectoryHistory([]);
+    setLandingScore(null);
+    setLandingState(createLandingState());
+
+    // Clear particles and snap camera.
+    particleSystemRef.current.clear();
+    cameraRef.current.reset();
+
+    // Stop audio.
+    audioManagerRef.current.stopAllSounds();
+    audioManagerRef.current.playSound("ui-select");
+    engineSoundPlayingRef.current = false;
+
+    performanceMonitorRef.current.reset();
   }, []);
 
-  // === RENDER ===
+  /** Handle goal selector change. */
+  const handleGoalChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
+    const goal = ALTITUDE_GOALS.find((g) => g.name === e.target.value);
+    if (goal) {
+      setSelectedGoal(goal);
+      setCustomGoalAltitude(null); // Clear custom goal when preset is selected
+      audioManagerRef.current.playSound("ui-select");
+    }
+  }, []);
 
+  /** Handle custom goal altitude input. */
+  const handleCustomGoal = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    if (val === "") {
+      setCustomGoalAltitude(null);           // Empty input clears custom goal
+      setSelectedGoal(ALTITUDE_GOALS[0]);    // Fall back to first preset
+    } else {
+      const alt = parseFloat(val);
+      if (!isNaN(alt) && alt > 0) {
+        setCustomGoalAltitude(alt);  // Store valid positive altitude
+        setSelectedGoal(null);       // Deselect preset when custom is entered
+      }
+    }
+  }, []);
+
+  /** Handle volume slider change. */
+  const handleVolumeChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const vol = parseFloat(e.target.value);
+    setMasterVolume(vol);
+    audioManagerRef.current.setMasterVolume(vol); // Apply to AudioManager immediately
+  }, []);
+
+  /** Handle canvas click to trigger a burst of thrust. */
+  const handleCanvasClick = useCallback(() => {
+    keysPressed.current["mouseClick"] = true; // Set for next game loop tick
+  }, []);
+
+  // ── OVERLAY STYLE HELPERS ─────────────────────────────────────────────────
+
+  // Shared style for the semi-transparent top control bar.
+  const topBarStyle: React.CSSProperties = {
+    position:        "absolute",
+    top:             0,
+    left:            0,
+    right:           0,
+    display:         "flex",
+    flexWrap:        "wrap",
+    gap:             "8px",
+    alignItems:      "center",
+    padding:         "8px 12px",
+    backgroundColor: "rgba(5, 8, 25, 0.85)", // Dark semi-transparent
+    backdropFilter:  "blur(4px)",             // Frosted-glass effect
+    borderBottom:    `1px solid ${COLORS.ui}`,
+    fontFamily:      "monospace",
+    color:           COLORS.text,
+    fontSize:        "13px",
+    zIndex:          10,
+  };
+
+  // Shared style for all top-bar control groups.
+  const controlGroupStyle: React.CSSProperties = {
+    display:    "flex",
+    alignItems: "center",
+    gap:        "6px",
+  };
+
+  // Style for select/input controls in the top bar.
+  const selectStyle: React.CSSProperties = {
+    padding:         "4px 6px",
+    backgroundColor: "#0d1a35",
+    color:           COLORS.text,
+    border:          `1px solid ${COLORS.ui}`,
+    borderRadius:    "3px",
+    cursor:          "pointer",
+    fontSize:        "12px",
+    fontFamily:      "monospace",
+  };
+
+  // Style for buttons in the top bar.
+  const btnStyle = (active: boolean, accent?: string): React.CSSProperties => ({
+    padding:         "4px 10px",
+    backgroundColor: active ? (accent ?? COLORS.ui) : "rgba(15, 25, 50, 0.9)",
+    color:           active ? "#fff" : COLORS.text,
+    border:          `1px solid ${active ? (accent ?? COLORS.ui) : "rgba(74,111,165,0.5)"}`,
+    borderRadius:    "3px",
+    cursor:          "pointer",
+    fontSize:        "12px",
+    fontFamily:      "monospace",
+    fontWeight:      active ? "bold" : "normal",
+  });
+
+  // ── RENDER ───────────────────────────────────────────────────────────────
   return (
+    // Root container: fixed position filling the entire viewport, overflow hidden
+    // so the canvas never creates a scrollbar.
     <div
       style={{
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        justifyContent: "center",
-        minHeight: "100vh",
-        backgroundColor: COLORS.background,
+        position:   "fixed",  // Fixed removes it from normal flow
+        inset:      0,         // top/right/bottom/left all 0 — fills viewport
+        overflow:   "hidden",  // Prevent scrollbars from appearing
         fontFamily: "monospace",
-        color: COLORS.text,
+        color:      COLORS.text,
       }}
     >
+      {/* CANVAS — fills the entire window, sits behind all overlays */}
+      <canvas
+        ref={canvasRef}
+        width={canvasWidth}   // Drawing buffer width (actual canvas resolution)
+        height={canvasHeight} // Drawing buffer height
+        onClick={handleCanvasClick} // Click triggers burst thrust
+        style={{
+          position: "absolute", // Behind all overlays
+          top:      0,
+          left:     0,
+          width:    "100%",   // CSS size = 100% viewport (matches buffer size)
+          height:   "100%",
+          cursor:   "crosshair", // Crosshair cursor indicates click-to-thrust
+        }}
+      />
+
+      {/* ── TOP CONTROL BAR ─────────────────────────────────────────────── */}
+      {/* Positioned absolutely over the canvas. Semi-transparent overlay. */}
+      <div style={topBarStyle}>
+
+        {/* Rocket selector */}
+        <div style={controlGroupStyle}>
+          <span>Rocket:</span>
+          <select value={rocketConfig.name} onChange={handleRocketChange} style={selectStyle}>
+            <option value="Simple Two-Stage">Simple Two-Stage</option>
+            <option value="Falcon 9 Inspired">Falcon 9 Inspired</option>
+            <option value="Three-Stage Heavy">Three-Stage Heavy</option>
+          </select>
+        </div>
+
+        {/* Goal selector */}
+        <div style={controlGroupStyle}>
+          <span>Goal:</span>
+          <select
+            value={selectedGoal?.name ?? "custom"}
+            onChange={handleGoalChange}
+            style={selectStyle}
+          >
+            {ALTITUDE_GOALS.map((g) => (
+              <option key={g.name} value={g.name}>{g.name}</option>
+            ))}
+          </select>
+        </div>
+
+        {/* Custom altitude input */}
+        <div style={controlGroupStyle}>
+          <span>Custom (m):</span>
+          <input
+            type="number"
+            value={customGoalAltitude ?? ""}
+            onChange={handleCustomGoal}
+            placeholder="altitude"
+            style={{ ...selectStyle, width: "90px" }}
+          />
+        </div>
+
+        {/* Reset button */}
+        <button onClick={handleReset} style={btnStyle(false)}>
+          ↺ Reset
+        </button>
+
+        {/* Vertical separator */}
+        <div style={{ width: "1px", height: "22px", backgroundColor: COLORS.ui, opacity: 0.4 }} />
+
+        {/* ── TIME CONTROLS ──────────────────────────────────────────── */}
+        <div style={controlGroupStyle}>
+          <span>Speed:</span>
+          {/* Pause button */}
+          <button
+            onClick={() => setIsPaused((p) => !p)}
+            style={btnStyle(isPaused, "#cc6600")}
+            title="Pause/Resume (0 key)"
+          >
+            {isPaused ? "▶ RESUME" : "⏸ PAUSE"}
+          </button>
+          {/* 1× speed */}
+          <button
+            onClick={() => { setTimeMultiplier(1);  setIsPaused(false); }}
+            style={btnStyle(!isPaused && timeMultiplier === 1,  "#226633")}
+            title="1× speed (1 key)"
+          >1×</button>
+          {/* 2× speed */}
+          <button
+            onClick={() => { setTimeMultiplier(2);  setIsPaused(false); }}
+            style={btnStyle(!isPaused && timeMultiplier === 2,  "#226633")}
+            title="2× speed (2 key)"
+          >2×</button>
+          {/* 5× speed */}
+          <button
+            onClick={() => { setTimeMultiplier(5);  setIsPaused(false); }}
+            style={btnStyle(!isPaused && timeMultiplier === 5,  "#446611")}
+            title="5× speed (3 key)"
+          >5×</button>
+          {/* 10× speed */}
+          <button
+            onClick={() => { setTimeMultiplier(10); setIsPaused(false); }}
+            style={btnStyle(!isPaused && timeMultiplier === 10, "#663311")}
+            title="10× speed (4 key)"
+          >10×</button>
+        </div>
+
+        {/* Vertical separator */}
+        <div style={{ width: "1px", height: "22px", backgroundColor: COLORS.ui, opacity: 0.4 }} />
+
+        {/* ── AUDIO CONTROLS ─────────────────────────────────────────── */}
+        <div style={controlGroupStyle}>
+          <button
+            onClick={() => {
+              const muted = audioManagerRef.current.toggleMute();
+              setAudioMuted(muted);
+            }}
+            style={btnStyle(audioMuted, "#882222")}
+            title="Toggle mute (M key)"
+          >
+            {audioMuted ? "🔇 MUTED" : "🔊 AUDIO"}
+          </button>
+          <input
+            type="range"
+            min="0" max="1" step="0.05"
+            value={masterVolume}
+            onChange={handleVolumeChange}
+            style={{ width: "70px", cursor: "pointer", accentColor: COLORS.ui }}
+            title="Master volume"
+          />
+          <span style={{ fontSize: "11px" }}>{Math.round(masterVolume * 100)}%</span>
+        </div>
+
+        {/* Key hint */}
+        <div style={{ marginLeft: "auto", fontSize: "11px", opacity: 0.6 }}>
+          SPACE=thrust · A/D=steer · 0-4=speed · P=perf · M=mute
+        </div>
+      </div>
+
+      {/* ── TRAJECTORY PANEL — bottom-left overlay ────────────────────────── */}
+      {!showFullscreenTrajectory && (
+        <div
+          style={{
+            position: "absolute",
+            bottom:   INFO_PANEL_MARGIN,
+            left:     INFO_PANEL_MARGIN,
+            width:    TRAJECTORY_PANEL_WIDTH,
+            height:   TRAJECTORY_PANEL_HEIGHT,
+            zIndex:   10,
+          }}
+        >
+          <TrajectoryPanel
+            rocketState={displayFlightState as any} // TrajectoryPanel accepts RocketState shape
+            trajectoryHistory={trajectoryHistory}
+            isFullscreen={false}
+            onCloseFullscreen={() => {}}
+          />
+          {/* Expand button in the top-right corner of the trajectory panel */}
+          <button
+            onClick={() => setShowFullscreenTrajectory(true)}
+            style={{
+              position:        "absolute",
+              top:             "4px",
+              right:           "4px",
+              padding:         "2px 6px",
+              fontSize:        "11px",
+              backgroundColor: COLORS.ui,
+              color:           COLORS.text,
+              border:          `1px solid ${COLORS.text}`,
+              cursor:          "pointer",
+              borderRadius:    "2px",
+              zIndex:          11,
+            }}
+            title="Expand trajectory to fullscreen"
+          >⛶</button>
+        </div>
+      )}
+
+      {/* ── FULLSCREEN TRAJECTORY VIEW ──────────────────────────────────────── */}
       {showFullscreenTrajectory && (
         <TrajectoryPanel
-          rocketState={flightState as any}
+          rocketState={displayFlightState as any}
           trajectoryHistory={trajectoryHistory}
           isFullscreen={true}
           onCloseFullscreen={() => setShowFullscreenTrajectory(false)}
         />
       )}
 
-      {!showFullscreenTrajectory && (
-        <>
-          <h1 style={{ marginBottom: "20px" }}>🚀 Multi-Stage Rocket Simulator</h1>
+      {/* ── LANDING RESULTS MODAL — centered overlay ────────────────────────── */}
+      {landingScore !== null && (
+        <div
+          style={{
+            position:        "absolute",
+            top:             "50%",
+            left:            "50%",
+            transform:       "translate(-50%, -50%)", // True center of viewport
+            backgroundColor: "rgba(5, 8, 25, 0.95)",
+            border:          `2px solid ${COLORS.ui}`,
+            borderRadius:    "6px",
+            padding:         "20px 28px",
+            minWidth:        "300px",
+            textAlign:       "center",
+            zIndex:          20,
+            backdropFilter:  "blur(8px)",
+          }}
+        >
+          <h2 style={{ marginTop: 0, color: COLORS.trajectory }}>Landing Report</h2>
 
-          <div style={{ position: "relative" }}>
-            <canvas
-              ref={canvasRef}
-              width={CANVAS_WIDTH}
-              height={CANVAS_HEIGHT}
-              onClick={handleCanvasClick}
-              style={{
-                border: `2px solid ${COLORS.ui}`,
-                cursor: "pointer",
-                marginBottom: "20px",
-                backgroundColor: COLORS.background,
-              }}
-            />
-
-            <div style={{ position: "absolute", bottom: "20px", left: "20px" }}>
-              <TrajectoryPanel
-                rocketState={flightState as any}
-                trajectoryHistory={trajectoryHistory}
-                isFullscreen={false}
-                onCloseFullscreen={() => {}}
-              />
-              <button
-                onClick={() => setShowFullscreenTrajectory(true)}
-                style={{
-                  position: "absolute",
-                  bottom: "10px",
-                  right: "10px",
-                  padding: "4px 8px",
-                  fontSize: "12px",
-                  backgroundColor: COLORS.ui,
-                  color: COLORS.text,
-                  border: `1px solid ${COLORS.text}`,
-                  cursor: "pointer",
-                  borderRadius: "3px",
-                }}
-                title="Expand to fullscreen"
-              >
-                ⛶
-              </button>
-            </div>
+          {/* Score — big colored number */}
+          <div style={{
+            fontSize: "48px",
+            fontWeight: "bold",
+            color: landingScore >= 80 ? "#44ff44" : landingScore >= 50 ? "#ffaa00" : "#ff4444",
+            margin: "8px 0",
+          }}>
+            {landingScore.toFixed(0)}<span style={{ fontSize: "20px" }}>/100</span>
           </div>
 
-          <div style={{ marginBottom: "15px", textAlign: "center" }}>
-            <p>SPACEBAR: Hold for thrust | CLICK: Burst | P: Perf | M: Mute | ESC: Close fullscreen</p>
-          </div>
+          {/* Quality label */}
+          <p style={{ margin: "4px 0", fontSize: "16px" }}>
+            {landingState.landingQuality}
+          </p>
 
-          <div
-            style={{
-              display: "flex",
-              gap: "20px",
-              marginBottom: "20px",
-              flexWrap: "wrap",
-              justifyContent: "center",
-              alignItems: "center",
-            }}
-          >
-            <div>
-              <label style={{ marginRight: "10px" }}>Rocket: </label>
-              <select
-                value={rocketConfig.name}
-                onChange={handleRocketChange}
-                style={{
-                  padding: "8px",
-                  backgroundColor: COLORS.ui,
-                  color: COLORS.text,
-                  border: `1px solid ${COLORS.text}`,
-                  cursor: "pointer",
-                }}
-              >
-                <option value="Simple Two-Stage">Simple Two-Stage</option>
-                <option value="Falcon 9 Inspired">Falcon 9 Inspired</option>
-                <option value="Three-Stage Heavy">Three-Stage Heavy</option>
-              </select>
-            </div>
+          {/* Details grid */}
+          <table style={{ width: "100%", fontSize: "13px", borderCollapse: "collapse", marginTop: "12px" }}>
+            <tbody>
+              {[
+                ["Max Altitude", `${(displayFlightState.maxAltitudeReached / 1000).toFixed(2)} km`],
+                ["Landing Velocity", `${Math.abs(displayFlightState.landingVelocity).toFixed(1)} m/s`],
+                ["Structural Damage", `${landingState.structuralDamage.toFixed(1)}%`],
+                ["Reusable", landingState.isReusable ? "✓ YES" : "✗ NO"],
+                ["Stages Separated", `${displayFlightState.stageSeparationCount}`],
+                ["Parachutes Used", `${landingState.parachutesDeployed}`],
+              ].map(([label, value]) => (
+                <tr key={label}>
+                  <td style={{ textAlign: "left", padding: "3px 8px", color: "#aabbcc" }}>{label}</td>
+                  <td style={{ textAlign: "right", padding: "3px 8px", fontWeight: "bold" }}>{value}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
 
-            <div>
-              <label style={{ marginRight: "10px" }}>Goal: </label>
-              <select
-                value={selectedGoal?.name || "custom"}
-                onChange={handleGoalChange}
-                style={{
-                  padding: "8px",
-                  backgroundColor: COLORS.ui,
-                  color: COLORS.text,
-                  border: `1px solid ${COLORS.text}`,
-                  cursor: "pointer",
-                }}
-              >
-                {ALTITUDE_GOALS.map((goal) => (
-                  <option key={goal.name} value={goal.name}>
-                    {goal.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <label style={{ marginRight: "10px" }}>Custom (m): </label>
-              <input
-                type="number"
-                value={customGoalAltitude || ""}
-                onChange={handleCustomGoal}
-                placeholder="Enter altitude"
-                style={{
-                  padding: "8px",
-                  backgroundColor: COLORS.ui,
-                  color: COLORS.text,
-                  border: `1px solid ${COLORS.text}`,
-                }}
-              />
-            </div>
-
+          {/* Dismiss / Reset buttons */}
+          <div style={{ display: "flex", gap: "10px", marginTop: "16px", justifyContent: "center" }}>
             <button
-              onClick={handleReset}
+              onClick={() => setLandingScore(null)} // Dismiss modal but keep the landed state
               style={{
-                padding: "8px 15px",
-                backgroundColor: COLORS.ui,
-                color: COLORS.text,
-                border: `1px solid ${COLORS.text}`,
-                cursor: "pointer",
-                fontSize: "14px",
+                ...btnStyle(false),
+                padding: "6px 16px",
               }}
             >
-              Reset
+              Dismiss
             </button>
-
-            {/* === NEW: AUDIO CONTROLS === */}
-            <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
-              <button
-                onClick={() => {
-                  const newMuted = audioManagerRef.current.toggleMute();
-                  setAudioMuted(newMuted);
-                }}
-                style={{
-                  padding: "8px 12px",
-                  backgroundColor: audioMuted ? "#ff4444" : COLORS.ui,
-                  color: COLORS.text,
-                  border: `1px solid ${COLORS.text}`,
-                  cursor: "pointer",
-                  fontSize: "14px",
-                }}
-                title="Toggle mute (M key)"
-              >
-                {audioMuted ? "🔇 MUTED" : "🔊 AUDIO"}
-              </button>
-
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.1"
-                value={masterVolume}
-                onChange={handleVolumeChange}
-                style={{ width: "100px", cursor: "pointer" }}
-                title="Master volume"
-              />
-              <span style={{ fontSize: "12px" }}>{Math.round(masterVolume * 100)}%</span>
-            </div>
-          </div>
-
-          {landingScore !== null && (
-            <div
+            <button
+              onClick={handleReset} // Full reset for another flight
               style={{
-                padding: "15px",
-                backgroundColor: "rgba(74, 111, 165, 0.3)",
-                border: `2px solid ${COLORS.ui}`,
-                marginBottom: "20px",
-                textAlign: "center",
+                ...btnStyle(true, COLORS.ui),
+                padding: "6px 16px",
               }}
             >
-              <p>
-                Landing Score: <strong>{landingScore.toFixed(0)}/100</strong>
-              </p>
-              <p>
-                Landing Quality: <strong>{landingState.landingQuality}</strong>
-              </p>
-              <p>
-                Structural Damage: {landingState.structuralDamage.toFixed(1)}%
-              </p>
-              <p>
-                Reusable: {landingState.isReusable ? "✓ YES" : "✗ NO"}
-              </p>
-              <p>
-                Max Altitude:{" "}
-                {(flightState.maxAltitudeReached / 1000).toFixed(2)} km
-              </p>
-              <p>
-                Landing Velocity:{" "}
-                {Math.abs(flightState.landingVelocity).toFixed(2)} m/s
-              </p>
-              <p>
-                Stages Separated: {flightState.stageSeparationCount}
-              </p>
-              <p>
-                Parachutes Deployed: {landingState.parachutesDeployed}
-              </p>
-            </div>
-          )}
-        </>
+              ↺ Fly Again
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );
