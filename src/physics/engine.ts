@@ -272,10 +272,45 @@ export function updatePhysics(
   // Sum of thrust (N) from all stages currently firing (active, not separated, has fuel, throttle > 0).
   const totalThrust = calculateTotalThrust(config);
 
-  // ── GRAVITY ──
-  // Always acts downward: −g in the Y direction.
-  // Negative because our Y axis is positive-up and gravity pulls down.
-  accelerationY -= simConfig.gravity;
+  // ── GRAVITY (ALTITUDE-DEPENDENT INVERSE-SQUARE LAW) ─────────────────────────
+  // Gravity weakens with distance from Earth's center according to Newton's
+  // law of universal gravitation: F = G·M·m / r². For surface gravity:
+  //
+  //   g(h) = g₀ × (R_earth / (R_earth + h))²
+  //
+  //   g₀      = 9.81 m/s² — sea-level surface gravity constant
+  //   R_earth = 6,371,000 m — mean Earth radius
+  //   h       = altitude above sea level in meters (state.position.y)
+  //
+  // Worked examples (why this matters above 100 km):
+  //   h = 0 m     → g = 9.810 m/s² (full gravity at sea level)
+  //   h = 100 km  → g = 9.508 m/s² (Kármán line, 97% of surface gravity)
+  //   h = 400 km  → g = 8.686 m/s² (ISS orbital altitude, 89% — NOT "zero-g"!)
+  //   h = 35,786 km → g = 0.224 m/s² (geostationary orbit, 2.3%)
+  //   h = 384,400 km → g = 0.0027 m/s² (Moon distance, 0.03%)
+  //
+  // WHY THE ISS APPEARS WEIGHTLESS: Astronauts float not because gravity is
+  // absent (it's 89% of sea level!), but because both they AND the ISS are in
+  // free fall. They fall at the same rate, so there's no contact force between
+  // body and floor — that's what "weightlessness" actually means physically.
+  //
+  // IMPACT ON SIMULATION: Without this fix, a rocket above 100 km would still
+  // experience exactly 9.81 m/s² downward deceleration even in "space", making
+  // it fall far too fast. With the fix, gravity is slightly reduced but non-zero,
+  // so a coasting rocket gradually slows down — correctly, per Newton's First Law.
+  const EARTH_RADIUS = 6_371_000; // m — mean equatorial radius of Earth
+  // Clamp altitude to ≥ 0 so negative (underground) values don't produce invalid gravity.
+  const altitudeForGravity = Math.max(0, state.position.y); // m — rocket's current altitude
+  // Compute the inverse-square gravity at this altitude.
+  // Math.pow(EARTH_RADIUS / (EARTH_RADIUS + h), 2) is always ≤ 1.0 and falls
+  // toward zero as h approaches infinity, but is very close to 1.0 below 100 km.
+  const gravityAtAltitude = simConfig.gravity * Math.pow(
+    EARTH_RADIUS / (EARTH_RADIUS + altitudeForGravity), // Ratio of radii
+    2 // Squared: inverse-square law
+  ); // m/s² — gravitational acceleration at current altitude
+  // Apply downward gravitational acceleration. Negative because Y is positive-up
+  // and gravity acts downward. This correctly weakens above 100 km.
+  accelerationY -= gravityAtAltitude;
 
   // ── THRUST ──
   // Thrust acts along the rocket's pointing direction, decomposed into X and Y components.
@@ -452,9 +487,63 @@ export function updatePhysics(
     groundImpact = true;
   }
 
-  // Also clamp if below ground when NOT flying (e.g., on initial placement).
-  if (state.position.y < 0 && !state.isFlying) {
-    state.position.y = 0;
+  // ── GROUND CONTACT PHYSICS (PRE-LAUNCH CONSTRAINT) ─────────────────────────
+  // When the rocket is on or below the ground surface AND has not yet launched
+  // (isFlying === false), we must enforce the ground constraint. In real physics,
+  // the ground exerts a "normal force" that exactly cancels gravity, preventing
+  // the rocket from accelerating through the Earth.
+  //
+  // THREE THINGS MUST HAPPEN WHEN ON THE GROUND BEFORE LAUNCH:
+  //   1. position.y is clamped to 0 (rocket cannot go below ground surface)
+  //   2. velocity.y is zeroed if negative (ground stops the fall — Newton's 3rd Law:
+  //      the ground pushes back with equal force to whatever is pushing down)
+  //   3. acceleration.y is zeroed if negative (the normal force cancels any net
+  //      downward force — no phantom downward acceleration on the launchpad)
+  //
+  // WHY THIS FIX IS CRITICAL:
+  //   Without this constraint, every physics frame applies gravity:
+  //     velocity.y += -9.81 × deltaTime  →  after 8 seconds: -78.5 m/s
+  //   The position is clamped to 0 by the condition below, so the rocket never
+  //   sinks underground, but the VELOCITY keeps accumulating every frame while
+  //   the rocket appears stationary. After 8 seconds: VY = -80 m/s at ALT = 0 m.
+  //   This is physically impossible — a stationary object on the ground cannot
+  //   have -80 m/s velocity. The ground's normal force prevents this.
+  //
+  // WHAT HAPPENS WITH THRUST:
+  //   If engine throttle ramps up and thrust exceeds weight (TWR > 1.0), the net
+  //   acceleration becomes POSITIVE: accel.y = thrust/mass - gravity > 0.
+  //   With positive acceleration, velocity.y becomes positive, position.y rises
+  //   above 0, and this ground constraint does NOT apply (it only triggers when
+  //   position.y ≤ 0). The rocket lifts off naturally. This is correct behavior.
+  //
+  // HORIZONTAL CONSTRAINT:
+  //   velocity.x and acceleration.x are also zeroed because the rocket is clamped
+  //   to the launchpad with structural clamps — wind cannot push a secured rocket
+  //   off the pad before launch. Real rockets use hold-down bolts for exactly this.
+  if (state.position.y <= 0 && !state.isFlying) {
+    // 1. Clamp position to ground level — cannot go underground.
+    state.position.y = 0; // m — floor at sea level
+
+    // 2. Zero downward vertical velocity: the ground stops the fall.
+    // We only zero NEGATIVE velocity (downward) — if thrust has pushed velocity.y
+    // positive this frame, we must NOT zero it, or the rocket can never lift off.
+    if (state.velocity.y < 0) {
+      state.velocity.y = 0; // m/s — ground stops downward motion immediately
+    }
+
+    // 3. Zero downward vertical acceleration: normal force cancels gravity + drag.
+    // Again, only zero NEGATIVE acceleration — positive acceleration means thrust
+    // is winning over gravity and the rocket is about to leave the ground.
+    if (state.acceleration.y < 0) {
+      state.acceleration.y = 0; // m/s² — normal force exactly cancels downward forces
+    }
+
+    // 4. Zero ALL horizontal kinematics: launch clamps hold the rocket steady.
+    // Wind force (accelerationX) and any residual drift (velocity.x) are cancelled
+    // by the structural hold-down system. Without this, a 3 m/s wind would
+    // push the rocket off the pad before launch, which is unrealistic.
+    state.velocity.x = 0;     // m/s — no horizontal drift on the launchpad
+    state.acceleration.x = 0; // m/s² — hold-down system cancels wind force
   }
 
   // ── TIME TRACKING ──

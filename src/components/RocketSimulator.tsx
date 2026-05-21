@@ -354,6 +354,30 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   const loggedParaRef      = useRef<boolean>(false); // True after parachute deploy logged
   const prevStageSepRef    = useRef<number>(0);       // Previous stage separation count
 
+  // ── AUTO-FLY SYSTEM REFS ──────────────────────────────────────────────────
+  // The auto-fly system follows an automated flight profile without any player input.
+  // It replaces manual spacebar/steering controls when active.
+
+  // Whether auto-fly autopilot is currently engaged. Written by both the keydown
+  // handler (F key toggle) and the game loop (manual override disables it).
+  // The game loop reads this ref — it never reads React state directly.
+  const autoFlyEnabledRef = useRef<boolean>(false); // true = autopilot active
+
+  // Mission elapsed time (state.timeElapsed) when auto-fly was most recently activated.
+  // Used to compute the "time since auto-fly start" (T+0 in the flight profile).
+  // Gravity turn starts at T+10s, so this ref tells us when T+0 was.
+  const autoFlyStartTimeRef = useRef<number>(0); // seconds — state.timeElapsed at activation
+
+  // Current auto-fly phase description, updated every physics frame.
+  // Passed to drawTelemetry so the HUD shows "MODE: AUTO-FLY (Gravity Turn 23°)" etc.
+  // Examples: "AUTO-FLY (Throttle Up)", "AUTO-FLY (Gravity Turn 34°)", "AUTO-FLY (Coast)"
+  const autoFlyStatusRef = useRef<string>("MANUAL"); // string displayed in MODE telemetry row
+
+  // Whether the player manually overrode auto-fly this frame (spacebar or A/D pressed).
+  // When true, auto-fly disengages and manual control resumes. F key re-engages.
+  // This ref is only used for detecting mid-flight manual intervention.
+  const autoFlyManualOverrideRef = useRef<boolean>(false); // true = player took manual control
+
   // ── REACT STATE (for DOM / UI rendering) ─────────────────────────────────────
 
   // Current rocket config used for the select box and reset logic.
@@ -437,6 +461,15 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
   // Keyboard shortcuts help overlay (toggle with ? key).
   const [showKeyboardHelp, setShowKeyboardHelp] = useState<boolean>(false);
+
+  // ── AUTO-FLY STATE (for React UI rendering only) ─────────────────────────────
+  // React state is only used for the top-bar button appearance ("AUTO-FLY: ON/OFF").
+  // The game loop reads autoFlyEnabledRef — never this React state — to avoid
+  // stale closure issues inside the rAF callback.
+  const [autoFlyEnabled, setAutoFlyEnabled] = useState<boolean>(false);
+  // autoFlyDisplayStatus is intentionally NOT stored in React state — the canvas
+  // HUD reads autoFlyStatusRef.current directly inside the rAF loop, which is always
+  // current without needing a React re-render cycle. The ref is the source of truth.
 
   // ── SYNC: React state → Refs ──────────────────────────────────────────────
   // These tiny effects write updated React state values into the corresponding refs
@@ -524,6 +557,36 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         setAudioMuted(muted);
         audioManagerRef.current.playSound("ui-click");
       }
+
+      // ── AUTO-FLY TOGGLE (F key) ──────────────────────────────────────────
+      // F key toggles the autopilot. When enabled, the rocket follows an automated
+      // flight profile: throttle ramp → vertical ascent → gravity turn → coast →
+      // optional landing burn. Manual spacebar/A/D presses disengage auto-fly;
+      // pressing F again re-engages it from the current flight state.
+      if (e.key === "f" || e.key === "F") {
+        // Compute the new enabled state (toggle from current ref, not React state,
+        // to avoid stale closure — the ref is always current).
+        const newEnabled = !autoFlyEnabledRef.current;
+        autoFlyEnabledRef.current = newEnabled; // Update the ref the game loop reads
+
+        if (newEnabled) {
+          // Auto-fly is being ENGAGED. Record the current mission elapsed time so
+          // the flight profile starts from "T+0 since auto-fly activation".
+          // If the rocket is already flying, the gravity turn will begin 10s later;
+          // if it hasn't launched yet, T+0 marks ignition in the auto-fly profile.
+          autoFlyStartTimeRef.current = flightStateRef.current.timeElapsed;
+          autoFlyManualOverrideRef.current = false; // Clear any previous manual override
+          autoFlyStatusRef.current = "AUTO-FLY (Throttle Up)"; // Initial phase label
+        } else {
+          // Auto-fly is being DISENGAGED (returning to full manual control).
+          // The rocket keeps its current velocity/angle — we just stop commanding it.
+          autoFlyStatusRef.current = "MANUAL"; // HUD returns to manual mode display
+        }
+
+        // Sync to React state so the top-bar button re-renders with the correct label.
+        setAutoFlyEnabled(newEnabled);
+        audioManagerRef.current.playSound("ui-click"); // Audible confirmation click
+      }
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
@@ -592,15 +655,187 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         const config = rocketConfigRef.current; // Current rocket config (ref — always fresh)
 
         // ── READ KEYS ────────────────────────────────────────────────────
-        const spacebar  = keysPressed.current[" "] ?? false;       // Thrust
-        const clickBurst = keysPressed.current["mouseClick"] ?? false; // Click burst
-        const tiltLeft  = (keysPressed.current["a"] ?? false) ||
-                          (keysPressed.current["arrowleft"] ?? false); // Steer left
-        const tiltRight = (keysPressed.current["d"] ?? false) ||
-                          (keysPressed.current["arrowright"] ?? false); // Steer right
+        // spacebar / tiltLeft / tiltRight may be overridden by auto-fly below.
+        let spacebar  = keysPressed.current[" "] ?? false;       // Thrust (may be overridden by auto-fly)
+        const clickBurst = keysPressed.current["mouseClick"] ?? false; // Click burst (one-shot)
+        let tiltLeft  = (keysPressed.current["a"] ?? false) ||
+                        (keysPressed.current["arrowleft"] ?? false); // Steer left (may be overridden)
+        let tiltRight = (keysPressed.current["d"] ?? false) ||
+                        (keysPressed.current["arrowright"] ?? false); // Steer right (may be overridden)
+
+        // ── AUTO-FLY LOGIC ────────────────────────────────────────────────
+        // When auto-fly is enabled, override the manual key inputs with computed
+        // autopilot commands. The autopilot follows a programmed flight profile:
+        //
+        //   T+0s to T+2s:   Throttle-up phase — hold spacebar true so throttle ramps
+        //                   from 0% to 100% at 50%/s (takes exactly 2 seconds).
+        //   T+2s to T+10s:  Vertical ascent — hold 100% throttle, angle = 0° (straight up).
+        //   T+10s to T+70s: Gravity turn — hold 100% throttle, tilt from 0° to 45° over
+        //                   60 seconds. This is how real rockets fly — tilting sideways
+        //                   gradually to build horizontal orbital velocity.
+        //   T+70s onward:   Orbital burn — hold 45° angle with full throttle until fuel runs out.
+        //   After fuel:     Coast phase — no throttle, conserve angle.
+        //   Descending <5km: Parachute auto-deploys (handled by existing parachute logic).
+        //   Descending <2km: Landing burn — re-ignite with retrograde (straight up) thrust.
+        //
+        // Manual override: if the player presses spacebar or A/D WHILE auto-fly is active,
+        // auto-fly is disengaged immediately and control returns to the player. They must
+        // press F again to re-engage auto-fly.
+        //
+        // Angle control: instead of modifying tiltLeft/tiltRight (which add angular velocity
+        // incrementally), we use a proportional controller AFTER updatePhysics() below to
+        // directly drive state.angularVelocity toward the desired angle. This gives precise,
+        // predictable attitude control without fighting the existing damping/restoring system.
+        let autoFlyTargetAngle = 0;     // Desired rocket angle this frame (radians from vertical)
+        let autoFlyPhaseLabel = "MANUAL"; // Human-readable phase name for the HUD MODE row
+
+        if (autoFlyEnabledRef.current) {
+          // Check if the player just grabbed manual control (spacebar, A, or D pressed).
+          // If so, disengage auto-fly immediately and let manual controls take over.
+          // We check on step === 0 only to avoid triggering on every sub-step.
+          if (step === 0 && (spacebar || tiltLeft || tiltRight)) {
+            // Player pressed a control key while auto-fly was active — disengage.
+            // The input will be passed through as manual control this frame.
+            autoFlyEnabledRef.current = false;  // Disable the autopilot ref
+            autoFlyManualOverrideRef.current = true; // Flag that player took over
+            autoFlyStatusRef.current = "MANUAL"; // Update HUD to show manual mode
+            setAutoFlyEnabled(false);             // Sync React state for button display
+            // Do NOT set spacebar = false here — pass the manual key through.
+          } else if (!autoFlyManualOverrideRef.current) {
+            // Auto-fly is active and no manual override. Compute autopilot commands.
+
+            // Time since auto-fly was activated (seconds).
+            // autoFlyStartTimeRef holds the state.timeElapsed value at activation.
+            // This gives us T+0=ignition, T+2=full throttle, T+10=gravity turn start.
+            const afT = state.timeElapsed - autoFlyStartTimeRef.current; // s — auto-fly elapsed
+
+            // Check whether any non-separated stage still has fuel.
+            // Once all fuel is consumed, we switch to coast/landing modes.
+            const hasAnyFuel = config.stages.some(
+              (s) => !s.isSeparated && s.fuelMass > 0 // At least one active stage with fuel
+            ); // boolean — true if there is fuel remaining anywhere
+
+            if (!state.isFlying || afT < 2) {
+              // PHASE 1: THROTTLE UP (T+0 to T+2s)
+              // Hold spacebar=true so applyMultiStageThrottle ramps throttle at 50%/s.
+              // This takes exactly 2 seconds to go from 0% → 100% throttle.
+              // The rocket won't lift off until TWR > 1, which happens partway through this phase.
+              spacebar = true;         // Simulate holding SPACE: ramp up throttle
+              tiltLeft = false;        // No steering during throttle-up (keep angle = 0°)
+              tiltRight = false;       // No steering
+              autoFlyTargetAngle = 0;  // rad — straight up during ignition
+              autoFlyPhaseLabel = "AUTO-FLY (Throttle Up)"; // HUD label
+
+            } else if (afT < 10 && hasAnyFuel) {
+              // PHASE 2: VERTICAL ASCENT (T+2s to T+10s)
+              // Full throttle, rocket points straight up. Build altitude before tilting.
+              // Real rockets do a brief vertical phase for stability and to clear the tower.
+              spacebar = true;         // Hold full throttle
+              tiltLeft = false;
+              tiltRight = false;
+              autoFlyTargetAngle = 0;  // rad — 0° = straight vertical (no tilt)
+              autoFlyPhaseLabel = "AUTO-FLY (Vertical Ascent)"; // HUD label
+
+            } else if (afT < 70 && hasAnyFuel) {
+              // PHASE 3: GRAVITY TURN (T+10s to T+70s, 60 seconds)
+              // Gradually tilt the rocket from 0° (vertical) to 45° (diagonal) over 60 seconds.
+              // This "gravity turn" is how real rockets build horizontal orbital velocity —
+              // it converts vertical kinetic energy into horizontal motion efficiently.
+              //
+              // Linear interpolation: progress goes from 0 (at T=10) to 1 (at T=70).
+              // Target angle goes from 0 rad (vertical) to π/4 rad (45° right of vertical).
+              const turnProgress = (afT - 10) / 60; // 0.0 to 1.0 over the 60-second turn
+              autoFlyTargetAngle = turnProgress * (Math.PI / 4); // 0 → π/4 radians (0° → 45°)
+              spacebar = true;  // Full throttle throughout the gravity turn
+              tiltLeft = false; // Angle is controlled by the proportional controller below,
+              tiltRight = false; // NOT by tiltLeft/tiltRight (which add incremental angular velocity)
+              const angleDegrees = (autoFlyTargetAngle * 180 / Math.PI).toFixed(0); // For display
+              autoFlyPhaseLabel = `AUTO-FLY (Gravity Turn ${angleDegrees}°)`; // e.g., "23°"
+
+            } else if (hasAnyFuel) {
+              // PHASE 4: ORBITAL BURN (T+70s onward, while fuel remains)
+              // Hold 45° angle and full throttle to maximize horizontal velocity.
+              // This continues until the stage runs out of fuel and separates.
+              autoFlyTargetAngle = Math.PI / 4; // rad — 45° constant tilt
+              spacebar = true;   // Full throttle
+              tiltLeft = false;
+              tiltRight = false;
+              autoFlyPhaseLabel = "AUTO-FLY (Orbital Burn)"; // HUD label
+
+            } else if (state.velocity.y > 0) {
+              // PHASE 5: COAST (after fuel exhausted, still ascending)
+              // Engine is off, rocket coasts on residual velocity. No thrust, no steering.
+              // Gravity and (above 100km: none; below 100km: tiny) drag decelerate it.
+              spacebar = false;  // No thrust — engines are off
+              tiltLeft = false;
+              tiltRight = false;
+              autoFlyTargetAngle = state.angle; // Keep current angle (no correction during coast)
+              autoFlyPhaseLabel = "AUTO-FLY (Coast Phase)"; // HUD label
+
+            } else if (state.velocity.y <= 0 && state.position.y > 5000) {
+              // PHASE 6: BALLISTIC DESCENT (above 5 km, falling back down)
+              // No fuel, no thrust. Rocket falls under gravity. Parachute will deploy
+              // automatically by the existing parachute logic when velocity < -5 m/s.
+              spacebar = false;
+              tiltLeft = false;
+              tiltRight = false;
+              autoFlyTargetAngle = 0; // Point straight up for aerodynamic stability during descent
+              autoFlyPhaseLabel = "AUTO-FLY (Ballistic Descent)"; // HUD label
+
+            } else if (state.velocity.y < 0 && state.position.y <= 5000 && state.position.y > 2000) {
+              // PHASE 7: PARACHUTE DESCENT (below 5 km, above 2 km)
+              // Parachute has deployed (or is about to). No thrust needed.
+              // The parachute drag force dramatically slows the descent.
+              spacebar = false;
+              tiltLeft = false;
+              tiltRight = false;
+              autoFlyTargetAngle = 0; // Upright for chute stability
+              autoFlyPhaseLabel = "AUTO-FLY (Parachute Deploy)"; // HUD label
+
+            } else if (state.velocity.y < 0 && state.position.y <= 2000) {
+              // PHASE 8: LANDING BURN (below 2 km, descending)
+              // If there is any remaining fuel in any stage, fire engines retrograde
+              // (pointing straight up) to slow the descent for a soft landing.
+              // This mimics SpaceX booster landing burns — a final engine burn to
+              // reduce velocity from ~100 m/s to < 5 m/s before touchdown.
+              const hasFuelForLanding = config.stages.some(
+                (s) => !s.isSeparated && s.fuelMass > 0 && s.isActive
+              ); // Check if any active stage has fuel for a landing burn
+
+              if (hasFuelForLanding) {
+                spacebar = true;       // Fire engines to slow descent
+                tiltLeft = false;
+                tiltRight = false;
+                autoFlyTargetAngle = 0; // Point straight up for retrograde (deceleration) thrust
+                autoFlyPhaseLabel = "AUTO-FLY (Landing Burn)"; // HUD label
+              } else {
+                // No fuel for landing burn — coast to touchdown with parachute only.
+                spacebar = false;
+                autoFlyTargetAngle = 0;
+                autoFlyPhaseLabel = "AUTO-FLY (Landing — No Fuel)";
+              }
+
+            } else {
+              // PHASE 9: ANY OTHER STATE (e.g., on the ground after landing)
+              // Auto-fly has nothing to do. Disengage automatically.
+              spacebar = false;
+              autoFlyTargetAngle = 0;
+              autoFlyPhaseLabel = "AUTO-FLY (Complete)";
+            }
+
+            // Update the status ref so drawTelemetry shows the current phase.
+            // This is written every sub-step; only the last sub-step's value shows in the HUD.
+            autoFlyStatusRef.current = autoFlyPhaseLabel; // Synced to React state every 3 frames
+          }
+        } else {
+          // Auto-fly is disabled — manual mode. Update the status ref to "MANUAL".
+          // This ensures the HUD shows "MODE: MANUAL" when auto-fly is off.
+          autoFlyStatusRef.current = "MANUAL"; // Human-readable mode for the HUD
+        }
 
         // ── APPLY CONTROLS ───────────────────────────────────────────────
         // Throttle ramp + angular velocity change from steering input.
+        // spacebar / tiltLeft / tiltRight may have been overridden by auto-fly above.
         applyControls(config, state, spacebar, clickBurst, tiltLeft, tiltRight, subDelta);
 
         // Clear mouse-click flag after the first sub-step — it's a one-shot event,
@@ -622,6 +857,33 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           subDelta
         );
         performanceMonitorRef.current.endPhysicsTimer();
+
+        // ── AUTO-FLY ANGLE CONTROLLER (post-physics proportional controller) ─
+        // After updatePhysics() has applied damping and the restoring force, we
+        // override angularVelocity with a proportional controller that drives the
+        // rocket angle toward the autopilot's desired target angle.
+        //
+        // WHY POST-PHYSICS: updatePhysics() applies angular damping and restoring
+        // force, then integrates angle += angularVelocity * dt. If we set
+        // angularVelocity BEFORE the physics call, damping fights our command.
+        // Setting it AFTER means the value we write is the starting angularVelocity
+        // for the NEXT frame's integration — giving us clean, lag-free control.
+        //
+        // PROPORTIONAL CONTROLLER FORMULA:
+        //   angularVelocity = K_p × (targetAngle − currentAngle)
+        //   K_p = 3.0 rad/s per radian of error
+        //   At 15° error (0.26 rad): ω = 0.79 rad/s → corrects in ~0.33 seconds
+        //   At 2° error (0.035 rad): ω = 0.10 rad/s → settles gently
+        //
+        // This is a simple P-controller (no I or D terms). It's good enough for
+        // a game simulator because the dynamics are slow compared to the frame rate.
+        if (autoFlyEnabledRef.current && !autoFlyManualOverrideRef.current && frame.state.isFlying) {
+          // Compute the error: difference between desired angle and current angle.
+          // autoFlyTargetAngle was set in the auto-fly block above, this frame.
+          const angleError = autoFlyTargetAngle - frame.state.angle; // radians — positive = turn right
+          // Apply proportional gain. K_p = 3.0 means ω increases 3 rad/s per radian of error.
+          frame.state.angularVelocity = angleError * 3.0; // rad/s — drives angle toward target
+        }
 
         // ── ATMOSPHERIC DATA COMPUTATION ─────────────────────────────────
         // Compute all altitude-dependent quantities used by the new systems.
@@ -1036,7 +1298,10 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       drawTelemetry(
         ctx, cw, ch, state, rocketConfigRef.current,
         activeMult, isPausedRef.current,
-        currentAtmoDataRef.current // NEW: atmospheric/structural telemetry bundle
+        currentAtmoDataRef.current, // Atmospheric/structural telemetry bundle
+        autoFlyStatusRef.current    // Auto-fly mode string for the MODE: HUD row
+        // Reading directly from the ref (not React state) so the HUD always shows
+        // the current frame's phase without waiting for a React re-render cycle.
       );
 
       // 8. Max-Q flash overlay — shown for 2 seconds after peak dynamic pressure.
@@ -1084,6 +1349,9 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         // Copy flight state to React state for overlay UI (landing modal, etc.).
         setDisplayFlightState({ ...flightStateRef.current });
 
+        // Sync auto-fly status string to React state so the HUD MODE row updates.
+        // The canvas HUD reads autoFlyStatusRef.current directly in the rAF loop —
+        // no React state sync needed for the canvas-drawn MODE row.
       }
 
       // ── TRAJECTORY BUFFER ────────────────────────────────────────────────
@@ -1206,6 +1474,15 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
     loggedMaxQRef.current      = false;
     loggedParaRef.current      = false;
     prevStageSepRef.current    = 0;
+
+    // ── RESET AUTO-FLY STATE ─────────────────────────────────────────────────
+    // Disengage the autopilot on reset — the player starts from scratch on the pad
+    // and should be in manual control by default. If they want auto-fly, they press F.
+    autoFlyEnabledRef.current = false;          // Disengage autopilot (game loop reads this)
+    autoFlyManualOverrideRef.current = false;   // Clear any manual override flag
+    autoFlyStartTimeRef.current = 0;            // Reset the T+0 reference time
+    autoFlyStatusRef.current = "MANUAL";        // HUD returns to manual mode label
+    setAutoFlyEnabled(false);                   // Sync React button state (re-renders button)
 
     // Cancel any in-progress Monte Carlo simulation so it doesn't call setState
     // on an unmounted or reset component. Then clear all MC UI state.
@@ -1474,6 +1751,41 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           ↺ Reset
         </button>
 
+        {/* AUTO-FLY toggle button.
+            Active state (autoFlyEnabled = true) shows a highlighted green button
+            with the current autopilot phase (e.g., "AUTO-FLY (Gravity Turn 23°)").
+            Inactive state shows muted blue-gray "AUTO-FLY: OFF".
+            Clicking the button has the same effect as pressing the F key — it toggles
+            the autopilot and syncs both autoFlyEnabledRef and autoFlyStatusRef. */}
+        <button
+          onClick={() => {
+            // Compute the new state (toggle current ref value, not React state,
+            // to stay in sync with the game loop which reads refs).
+            const newEnabled = !autoFlyEnabledRef.current;
+            autoFlyEnabledRef.current = newEnabled; // Update ref (read by game loop)
+
+            if (newEnabled) {
+              // Engaging auto-fly: record current mission time as the T+0 reference.
+              autoFlyStartTimeRef.current = flightStateRef.current.timeElapsed;
+              autoFlyManualOverrideRef.current = false; // Clear any previous manual override
+              autoFlyStatusRef.current = "AUTO-FLY (Throttle Up)"; // Initial HUD label
+            } else {
+              // Disengaging auto-fly: return to manual mode.
+              autoFlyStatusRef.current = "MANUAL"; // HUD shows manual mode
+            }
+
+            setAutoFlyEnabled(newEnabled);       // Re-render this button (ON/OFF label)
+            audioManagerRef.current.playSound("ui-click"); // Audible click feedback
+          }}
+          style={btnStyle(autoFlyEnabled, "#1a8c3a")} // Dark green when active
+          title="Toggle auto-fly autopilot (F key) — rocket flies itself with gravity turn"
+        >
+          {autoFlyEnabled
+            ? `✈ AUTO-FLY: ON`   // Show ON state — autopilot is commanding the rocket
+            : `✈ AUTO-FLY: OFF`  // Show OFF state — player has manual control
+          }
+        </button>
+
         {/* Vertical separator */}
         <div style={{ width: "1px", height: "22px", backgroundColor: COLORS.ui, opacity: 0.4 }} />
 
@@ -1540,9 +1852,9 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           <span style={{ fontSize: "11px" }}>{Math.round(masterVolume * 100)}%</span>
         </div>
 
-        {/* Key hint — updated to mention Max-Q and failure difficulty */}
+        {/* Key hint — updated to mention auto-fly F key and Max-Q */}
         <div style={{ marginLeft: "auto", fontSize: "11px", opacity: 0.6 }}>
-          SPACE=thrust · A/D=steer · 0-4=speed · P=perf · M=mute · Watch MAX-Q!
+          SPACE=thrust · A/D=steer · F=auto-fly · 0-4=speed · P=perf · M=mute · Watch MAX-Q!
         </div>
       </div>
 
@@ -2040,6 +2352,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
                   ["SPACE",       "Apply thrust burst"],
                   ["A / ←",       "Steer left"],
                   ["D / →",       "Steer right"],
+                  ["F",           "Toggle AUTO-FLY autopilot"],
                   ["0",           "Pause / Resume"],
                   ["1",           "1× speed"],
                   ["2",           "2× speed"],

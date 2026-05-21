@@ -802,11 +802,16 @@ export function drawTelemetry(
   config: MultiStageRocketConfig,
   timeMultiplier: number,
   isPaused: boolean,
-  atmoData?: AtmosphericTelemetry // NEW: optional atmospheric/structural data
+  atmoData?: AtmosphericTelemetry, // NEW: optional atmospheric/structural data
+  autoFlyStatus?: string           // NEW: auto-fly mode string ("MANUAL" or "AUTO-FLY (...)")
 ): void {
   const panelW = 240; // Panel width in pixels
-  // Panel height grows when atmospheric data is present (6 extra rows at 22px each = 132px).
-  const panelH = atmoData ? 450 : 320; // Extra rows for MACH, Q, MAX-Q, G, STRUCT, TEMP
+  // Panel height:
+  //   Base rows (alt, maxAlt, vy, speed, tilt, fuel, throttle, stage, time, status, mode, time-mult)
+  //   = 12 rows × 22px = 264px, plus 22px title+separator = 286px → round to 320
+  //   With atmoData (6 extra rows for MACH, Q, MAX-Q, G, STRUCT, TEMP) = 320 + 132 = 452
+  //   The autoFlyStatus row is always present (MODE: MANUAL) — it fits in the base count.
+  const panelH = atmoData ? 474 : 342; // Extra rows for MACH, Q, MAX-Q, G, STRUCT, TEMP
   const margin = 16;  // Gap from canvas edge
 
   // Position panel in the bottom-right corner.
@@ -896,12 +901,133 @@ export function drawTelemetry(
   const secs = (state.timeElapsed % 60).toFixed(1);
   line(`TIME: ${mins}m ${secs}s`, y); y += lh;
 
-  // ── Status ──
-  let status = "STANDBY";
-  let statusColor = "#aaaaaa";
-  if (state.isFlying)  { status = "FLYING";   statusColor = "#44ff44"; }
-  if (state.hasLanded) { status = "LANDED";   statusColor = "#ffaa00"; }
+  // ── Status (10 distinct states, all shown in YELLOW for visibility) ──────────
+  // The status reflects the rocket's actual flight phase, not just "FLYING/STANDBY".
+  // Using 10 states covers the entire flight envelope from pad through landing.
+  //
+  // Each state is determined by the combination of:
+  //   isFlying, hasLanded, velocity.y, position.y, throttle, landingVelocity
+  //
+  // IMPORTANT: All statuses are shown in YELLOW (#ffff00) so they stand out from
+  // the white telemetry text and are immediately visible to the player.
+  //
+  // STATE DECISION TREE:
+  //   !isFlying && !hasLanded → STANDBY (waiting) or IGNITION (engine lit)
+  //   isFlying && position.y < 10 → LIFTOFF (just left the pad)
+  //   isFlying && velocity.y > 0 && throttle > 0 → ASCENDING (burning upward)
+  //   isFlying && velocity.y > 0 && throttle == 0 → COASTING (engine off, still rising)
+  //   isFlying && |velocity.y| < 5 → APOGEE (crossing peak, velocity near zero)
+  //   isFlying && velocity.y < 0 && throttle > 0 → LANDING BURN (retro thrust)
+  //   isFlying && velocity.y < 0 → DESCENDING (falling back down)
+  //   hasLanded && |landingVelocity| > 20 → CRASHED (too fast)
+  //   hasLanded → LANDED (survived)
+  const activeStageForStatus = config.stages.find((s) => s.isActive && !s.isSeparated);
+  const currentThrottle = activeStageForStatus ? activeStageForStatus.thrustPercentage : 0;
+  // All statuses use the same yellow color for maximum visibility against the dark panel.
+  // Yellow (#ffff00) is the standard "caution/attention" color in aerospace displays.
+  const statusColor = "#ffff00"; // Yellow — consistent status highlight color
+
+  let status: string;
+
+  if (!state.isFlying && !state.hasLanded) {
+    // Rocket has not left the ground and has not previously landed.
+    // Two sub-states depending on whether the engine is firing:
+    //   STANDBY: engine is off (throttle = 0), waiting for user input
+    //   IGNITION: engine has lit (throttle > 0) but TWR is not yet > 1 for liftoff
+    //             or the rocket is in the first fraction of a second leaving the pad
+    if (currentThrottle > 0) {
+      // Engine throttle is above zero — the rocket is in the ignition sequence.
+      // At this moment the engine is building thrust. The rocket may be pressing
+      // against the hold-down clamps but not yet generating enough lift to rise.
+      status = "IGNITION"; // Engine lit, thrust building, not yet off the pad
+    } else {
+      // No throttle: rocket is sitting inert on the launchpad awaiting input.
+      status = "STANDBY"; // On pad, engines off, waiting for user to press SPACE
+    }
+
+  } else if (state.isFlying) {
+    // Rocket is airborne. Now determine the ascending/descending/apogee phase.
+    // position.y, velocity.y, and throttle together define the flight phase.
+
+    if (state.position.y < 10 && state.velocity.y > 0) {
+      // Just left the launchpad: altitude is very low (< 10 m) but positive velocity.
+      // "LIFTOFF" is the momentary state in the first meters above the pad.
+      // Below 10 m we know the rocket just cleared the pad this frame or recently.
+      status = "LIFTOFF"; // Just cleared the launchpad, climbing fast from zero
+
+    } else if (state.velocity.y > 1.0) {
+      // Rocket is moving upward (positive vertical velocity above 1 m/s threshold).
+      // Distinguish powered ascent from free-coast ascent by throttle:
+      //   ASCENDING: engine is on, actively burning to gain more altitude/velocity
+      //   COASTING:  engine is off, rocket continues upward on momentum alone
+      if (currentThrottle > 0) {
+        status = "ASCENDING"; // Engine firing, climbing under power
+      } else {
+        // Engine off but still rising — kinetic energy carries the rocket higher.
+        // Real rockets "coast" after MECO (Main Engine Cut-Off) to gain altitude
+        // without burning more fuel. The rocket gradually decelerates due to gravity.
+        status = "COASTING"; // Engine off, climbing on momentum, gravity slowing it
+      }
+
+    } else if (Math.abs(state.velocity.y) <= 1.0) {
+      // Vertical velocity is very close to zero (within ±1 m/s) — this is APOGEE.
+      // At apogee (Greek: "away from Earth") the rocket has stopped rising and is
+      // about to start falling. Velocity passes through zero here.
+      // The ±1 m/s window prevents rapid COASTING→APOGEE→DESCENDING flickering.
+      status = "APOGEE"; // Peak altitude reached — velocity.y crossing zero
+
+    } else if (state.velocity.y < -1.0) {
+      // Rocket is moving downward (negative vertical velocity below -1 m/s).
+      // Sub-states based on throttle:
+      //   LANDING BURN: engines firing during descent (retrograde thrust to slow down)
+      //   DESCENDING:   engines off, falling freely (or with parachute)
+      if (currentThrottle > 0) {
+        // Thrust with downward velocity = retrograde burn to slow the descent.
+        // Real SpaceX boosters do exactly this: a 30-second "landing burn" slows
+        // the first stage from ~200 m/s to under 5 m/s before touchdown.
+        status = "LANDING BURN"; // Retrograde thrust slowing the descent rate
+      } else {
+        // Engine off, falling downward. May have parachute deployed.
+        status = "DESCENDING"; // Falling back toward Earth under gravity
+      }
+    } else {
+      // Fallback: isFlying but velocity doesn't fit the above bins cleanly.
+      // This shouldn't normally be reached but prevents blank status display.
+      status = "ASCENDING"; // Default to ascending if edge case
+    }
+
+  } else if (state.hasLanded) {
+    // Rocket has touched down (hasLanded = true, set by the ground collision handler).
+    // Two outcomes based on impact velocity:
+    //   LANDED: velocity at impact was "survivable" (≤ 20 m/s absolute)
+    //   CRASHED: velocity at impact was destructive (> 20 m/s absolute)
+    //
+    // Real Falcon 9 targets < 2 m/s for reuse. Above 20 m/s is considered a hard
+    // landing that likely destroys the vehicle structure on impact.
+    if (Math.abs(state.landingVelocity) > 20) {
+      // Impact velocity exceeded safe threshold — structural damage or total loss.
+      status = "CRASHED"; // Impact too fast — vehicle likely destroyed
+    } else {
+      // Safe landing: impact was survivable, rocket can potentially be reused.
+      status = "LANDED"; // Successful touchdown within safe velocity limits
+    }
+  } else {
+    // Logically impossible (neither flying nor landed nor on pad) — defensive fallback.
+    status = "STANDBY"; // Safe default if state is somehow inconsistent
+  }
+
+  // Render the status line in yellow — all statuses use the same attention color.
   line(`STATUS: ${status}`, y, statusColor); y += lh;
+
+  // ── Flight Mode (MANUAL or AUTO-FLY phase) ────────────────────────────────
+  // Shows whether the rocket is under manual player control or auto-fly autopilot.
+  // "MODE: MANUAL" — player is controlling thrust and steering manually.
+  // "MODE: AUTO-FLY (Gravity Turn 23°)" — autopilot is active with its current phase.
+  // This line is always shown so the player always knows their control mode.
+  const modeText = autoFlyStatus ?? "MANUAL"; // Default to MANUAL if no autoFlyStatus given
+  // Mode color: cyan for auto-fly (attention-grabbing), dim gray for manual (background info).
+  const modeColor = (modeText !== "MANUAL") ? "#00ffff" : "#888888";
+  line(`MODE: ${modeText}`, y, modeColor); y += lh;
 
   // ── ATMOSPHERIC & STRUCTURAL TELEMETRY (new rows, only when data is available) ──
   if (atmoData) {
