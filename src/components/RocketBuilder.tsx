@@ -66,6 +66,10 @@ import { AudioManager } from "../utils/AudioSystem";
 import { COLORS } from "../utils/constants";
 // COLORS: shared color constants matching the rest of the simulator UI theme
 
+import { HologramViewer } from "./HologramViewer";
+// HologramViewer: renders a rotating 3D wireframe hologram of a rocket part on a canvas.
+// Used in the catalog tiles (thumbnail, auto-rotating) and in the assembly stack (static icon).
+
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
 const GRAVITY_MS2 = 9.81;
@@ -1184,13 +1188,13 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
 
     const isDisabled = isAssembling || !allowed; // Grey out if assembling or placement invalid
 
+    // isCurrentlyAssembling: true if THIS specific part is the one currently being installed.
+    // Used to pass the assemblyProgress to HologramViewer for the spinning-brighter animation.
+    const isCurrentlyAssembling = assembly?.part.id === part.id && assembly?.stageIndex === targetStageIndex;
+
     return (
       <div
         key={part.id} // Unique key for React list reconciliation
-        onClick={() => { // Click handler: start assembly if allowed
-          if (isDisabled) return; // Ignore clicks when disabled
-          startAssembly(part, targetStageIndex); // Begin the real-time assembly countdown
-        }}
         title={reason || part.description} // Tooltip: show placement rule violation or description
         style={{
           padding: "8px 10px",
@@ -1198,9 +1202,11 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
           backgroundColor: isDisabled ? "rgba(10,12,25,0.5)" : "rgba(15,25,55,0.8)", // Grey if disabled
           border: `1px solid ${isDisabled ? "rgba(74,111,165,0.2)" : "rgba(74,111,165,0.5)"}`,
           borderRadius: "4px",
-          cursor: isDisabled ? "not-allowed" : "pointer", // Show cursor type based on interactivity
-          opacity: isDisabled ? 0.5 : 1,                  // Dim disabled tiles
-          transition: "background-color 0.15s",            // Smooth hover transition
+          opacity: isDisabled ? 0.5 : 1,       // Dim disabled tiles
+          transition: "background-color 0.15s", // Smooth hover transition
+          display: "flex",                       // Row layout: hologram on left, text on right
+          gap: "10px",                           // Space between hologram and text
+          alignItems: "flex-start",              // Align hologram to the top of the tile
         }}
         onMouseEnter={(e) => { // Highlight on hover when enabled
           if (!isDisabled) (e.currentTarget as HTMLDivElement).style.backgroundColor = "rgba(20,40,90,0.9)";
@@ -1209,24 +1215,50 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
           if (!isDisabled) (e.currentTarget as HTMLDivElement).style.backgroundColor = "rgba(15,25,55,0.8)";
         }}
       >
-        {/* Part name line */}
-        <div style={{ fontWeight: "bold", fontSize: "12px", color: COLORS.text, marginBottom: "2px" }}>
-          {part.name}
+        {/* ── HOLOGRAM THUMBNAIL ─────────────────────────────────────────────
+             The HologramViewer renders a self-contained 100×100 canvas with a rotating
+             3D wireframe of this part. Clicking the hologram opens the 300×300 modal.
+             We stop click propagation on the hologram wrapper so clicking the hologram
+             does NOT also trigger the tile's assembly — only clicking the text area does. */}
+        <div
+          onClick={(e) => e.stopPropagation()} // Clicking the hologram opens the 3D modal, not assembly
+          style={{ flexShrink: 0 }}             // Hologram never shrinks even if catalog is narrow
+        >
+          <HologramViewer
+            partId={part.id}                            // Shape looked up from PART_SHAPES by this ID
+            isAssembling={isCurrentlyAssembling}        // Spin faster and glow during assembly
+            assemblyProgress={isCurrentlyAssembling ? assemblyProgress : 0} // Glow intensity 0–1
+          />
         </div>
-        {/* Key specifications line */}
-        <div style={{ fontSize: "10px", color: "#8899bb", marginBottom: "2px" }}>
-          {keySpec}
-        </div>
-        {/* Assembly time badge */}
-        <div style={{ fontSize: "10px", color: "#667799" }}>
-          {part.manufacturer} · {part.assemblyTimeSeconds}s install
-        </div>
-        {/* Warning tag if placement requires attention */}
-        {reason && (
-          <div style={{ fontSize: "10px", color: "#cc9900", marginTop: "2px" }}>
-            ⚠ {reason}
+
+        {/* ── PART TEXT INFO ────────────────────────────────────────────────
+             Clicking this area starts assembly. The hologram click is handled separately above. */}
+        <div
+          style={{ flex: 1, cursor: isDisabled ? "not-allowed" : "pointer", minWidth: 0 }}
+          onClick={() => { // Click handler on text area: start assembly if allowed
+            if (isDisabled) return; // Ignore clicks when disabled
+            startAssembly(part, targetStageIndex); // Begin the real-time assembly countdown
+          }}
+        >
+          {/* Part name line */}
+          <div style={{ fontWeight: "bold", fontSize: "12px", color: COLORS.text, marginBottom: "2px" }}>
+            {part.name}
           </div>
-        )}
+          {/* Key specifications line */}
+          <div style={{ fontSize: "10px", color: "#8899bb", marginBottom: "2px" }}>
+            {keySpec}
+          </div>
+          {/* Assembly time badge */}
+          <div style={{ fontSize: "10px", color: "#667799" }}>
+            {part.manufacturer} · {part.assemblyTimeSeconds}s install
+          </div>
+          {/* Warning tag if placement requires attention */}
+          {reason && (
+            <div style={{ fontSize: "10px", color: "#cc9900", marginTop: "2px" }}>
+              ⚠ {reason}
+            </div>
+          )}
+        </div>
       </div>
     );
   };
@@ -1267,8 +1299,16 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
 
         {/* ── NOSE CONE (top stage only) ── */}
         {isTop && stage.noseCone && (
-          <div style={{ display: "flex", justifyContent: "space-between", backgroundColor: "rgba(80,60,20,0.3)", borderRadius: "3px", padding: "3px 6px", marginBottom: "3px" }}>
-            <span style={{ color: "#ddcc88" }}>▲ {stage.noseCone.name}</span>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "rgba(80,60,20,0.3)", borderRadius: "3px", padding: "3px 6px", marginBottom: "3px" }}>
+            {/* Small hologram icon next to the nose cone name in the assembly stack */}
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <div style={{ transform: "scale(0.35)", transformOrigin: "left center", width: 35, height: 35, overflow: "hidden", flexShrink: 0 }}
+                onClick={(e) => e.stopPropagation()}>
+                {/* Scale-down wrapper: renders a 100×100 hologram shrunk to 35×35px via CSS transform */}
+                <HologramViewer partId={stage.noseCone.id} />
+              </div>
+              <span style={{ color: "#ddcc88" }}>▲ {stage.noseCone.name}</span>
+            </div>
             <button
               onClick={(e) => { e.stopPropagation(); removePart(stage.noseCone!, stage.stageIndex); }}
               style={{ background: "none", border: "none", color: "#cc4444", cursor: "pointer", fontSize: "12px", padding: "0 2px" }}
@@ -1305,8 +1345,15 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
 
         {/* ── ENGINES ── */}
         {stage.engines.map((e, idx) => (
-          <div key={idx} style={{ display: "flex", justifyContent: "space-between", backgroundColor: "rgba(60,25,15,0.5)", borderRadius: "3px", padding: "3px 6px", marginBottom: "2px" }}>
-            <span style={{ color: "#ffaa66" }}>🔥 {e.name} ({fmtThrust(e.thrustSeaLevel)})</span>
+          <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "rgba(60,25,15,0.5)", borderRadius: "3px", padding: "3px 6px", marginBottom: "2px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              {/* Tiny hologram icon for each engine in the assembly stack */}
+              <div style={{ transform: "scale(0.35)", transformOrigin: "left center", width: 35, height: 35, overflow: "hidden", flexShrink: 0 }}
+                onClick={(ev) => ev.stopPropagation()}>
+                <HologramViewer partId={e.id} />
+              </div>
+              <span style={{ color: "#ffaa66" }}>🔥 {e.name} ({fmtThrust(e.thrustSeaLevel)})</span>
+            </div>
             <button
               onClick={(ev) => { ev.stopPropagation(); removePart(e, stage.stageIndex); }}
               style={{ background: "none", border: "none", color: "#cc4444", cursor: "pointer", fontSize: "12px", padding: "0 2px" }}
