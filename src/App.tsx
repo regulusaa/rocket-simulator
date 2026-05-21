@@ -53,7 +53,27 @@ function App() {
   // When the user launches from RocketBuilder, the assembled config is stored here
   // and passed to RocketSimulator as `initialConfig`.
   // null means "use the simulator's default rocket selection" (Simple Two-Stage).
-  const [customConfig, setCustomConfig] = useState<MultiStageRocketConfig | null>(null);
+  //
+  // BUG FIX: We initialize from localStorage `rocket_custom_active` if available.
+  // Without this, a page refresh clears React state and reverts to the default rocket.
+  // The lazy initializer runs once on mount and reads the last-launched custom config.
+  // If the stored JSON is invalid or missing, we fall back to null (use default).
+  const [customConfig, setCustomConfig] = useState<MultiStageRocketConfig | null>(() => {
+    // Lazy initializer: runs once when App first mounts, not on every render.
+    // This allows us to perform the localStorage read without a useEffect + re-render.
+    try {
+      const raw = localStorage.getItem("rocket_custom_active"); // Read the last-launched config
+      if (!raw) return null; // No saved config: start with default rocket
+      const parsed = JSON.parse(raw) as MultiStageRocketConfig; // Deserialize JSON
+      // Validate the parsed object has the minimum required fields (name and stages array).
+      // Guards against corrupted localStorage data from old versions or manual edits.
+      if (typeof parsed.name !== "string" || !Array.isArray(parsed.stages)) return null;
+      return parsed; // Valid config: use it as the initial custom config
+    } catch {
+      // JSON parse error or localStorage unavailable: fall back to default gracefully.
+      return null; // Start with default rocket selection (Simple Two-Stage)
+    }
+  });
 
   // ── HANDLER: LAUNCH FROM BUILDER ─────────────────────────────────────────────
   // Called by RocketBuilder when the user clicks the LAUNCH button.

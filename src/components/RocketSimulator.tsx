@@ -107,6 +107,7 @@ import {
   getMachNumber,     // Mach = speed / local_speed_of_sound — needed for heating and drag telemetry
   getDynamicPressure, // Q = 0.5 × ρ × v² — primary structural load, drives Max-Q callout
   getTemperature,    // ISA temperature at altitude — used for stagnation temp calculation
+  getAirDensity,     // ρ(h) — air density at altitude, used for separated stage drag calculation
 } from "../physics/AtmosphereModel";
 
 import {
@@ -138,7 +139,118 @@ import {
 // This component renders the trajectory overlay plot, histograms, pie chart, and run table.
 import { MonteCarloPanel } from "./MonteCarloPanel";
 
+// ─── LOCALSTORAGE KEY CONSTANTS ──────────────────────────────────────────────
+// These must match the constants in RocketBuilder.tsx so saves written there
+// are readable here without any shared module (both files define the same strings).
+
+/** Registry key: JSON array of { id, name, timestamp } for all saved custom rockets. */
+const REGISTRY_KEY = "rocket_custom_list";
+
+/** Per-rocket config key prefix: full config stored at `rocket_custom_${id}`. */
+const STORAGE_KEY_PREFIX = "rocket_custom_";
+
+/** Active launch key: the most recently launched custom config from the builder. */
+const ACTIVE_ROCKET_KEY = "rocket_custom_active";
+
+// ─── TYPES ────────────────────────────────────────────────────────────────────
+
+/**
+ * Metadata entry in the rocket_custom_list registry.
+ * One entry per saved custom rocket; the full config is stored separately at
+ * `rocket_custom_${id}` to keep the registry small and fast to read.
+ */
+interface CustomRocketEntry {
+  id: string;        // Unique key suffix; full key = STORAGE_KEY_PREFIX + id
+  name: string;      // User-given name (displayed in the dropdown with "★" prefix)
+  timestamp: number; // Unix ms when saved (used for display and sort order)
+}
+
+/**
+ * Physics state for a rocket stage that has separated from the main vehicle.
+ *
+ * When a stage separates (fuel exhausted → staging event), it doesn't vanish.
+ * Instead it becomes an independent ballistic object subject to gravity and drag.
+ * If it has a parachute (or if we create one automatically), it can slow its descent
+ * and land safely — just like Falcon 9 booster recovery.
+ *
+ * This interface holds ALL state needed to simulate and render the separated stage.
+ */
+interface SeparatedStageState {
+  stageNumber: number;           // Which stage this was (config.stages[i].stageNumber)
+  stageName: string;             // Human-readable name (e.g., "Stage 1") for HUD display
+  position: { x: number; y: number }; // World-space position in meters (x=east of pad, y=altitude)
+  velocity: { x: number; y: number }; // World-space velocity in m/s
+  mass: number;                  // Dry mass in kg — all fuel is gone when the stage separates
+  parachute: Parachute;         // Parachute state — deployed when descending fast enough
+  parachuteDeployed: boolean;   // True after deployParachute() has been called (one-shot edge trigger)
+  hasLanded: boolean;            // True once position.y ≤ 0 (stage has hit the ground)
+  landingVelocity: number;       // m/s (negative = downward) at the moment of ground contact
+  landingX: number;              // x-coordinate (meters east of pad) where the stage landed
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+/**
+ * Read all saved custom rockets from localStorage and return them as an array.
+ * Returns an empty array if the registry is missing, empty, or corrupted.
+ * Never throws — all errors are silently caught so the simulator doesn't crash.
+ */
+function loadCustomRocketsFromStorage(): CustomRocketEntry[] {
+  try {
+    const raw = localStorage.getItem(REGISTRY_KEY); // Read the registry JSON string
+    if (!raw) return []; // Registry doesn't exist yet (first-time user): return empty array
+    const parsed = JSON.parse(raw) as CustomRocketEntry[]; // Deserialize the array
+    // Validate: must be an array (guard against corrupted localStorage or old formats)
+    if (!Array.isArray(parsed)) return [];
+    // Filter out entries with missing required fields to guard against partial corruption
+    return parsed.filter(
+      (e) => typeof e.id === "string" && typeof e.name === "string" && typeof e.timestamp === "number"
+    );
+  } catch {
+    return []; // JSON parse error or localStorage unavailable: return empty array gracefully
+  }
+}
+
+/**
+ * Compute a build quality score (0.0 – 1.0) for a given rocket config.
+ * Used when the user DOESN'T have a saved buildQualityScore (e.g., preset rockets).
+ *
+ * Pre-built presets (Falcon 9, Three-Stage, Simple) return the base preset quality of 0.82,
+ * which corresponds to a well-tested aerospace design with standard failure rates.
+ * Custom builds should already have buildQualityScore set in their config; this function
+ * is the fallback when that field is missing.
+ *
+ * Quality → Failure probability:  failureProb = (1 - quality) × 0.35
+ *   0.95 → ~1.75% failure (excellent design)
+ *   0.82 → ~6.3%  failure (solid preset / well-built custom)
+ *   0.70 → ~10.5% failure (mediocre design, several missing parts)
+ *   0.30 → ~24.5% failure (worst case, barely flyable)
+ *
+ * @param config  The rocket config to assess (uses name and stage count heuristics)
+ * @returns       Quality score in [0.30, 0.95]
+ */
+function computeBuildQuality(config: MultiStageRocketConfig): number {
+  // If the builder embedded a quality score when constructing this config, use it.
+  // This is the authoritative value computed from actual part-level design checks.
+  if (typeof config.buildQualityScore === "number") {
+    return config.buildQualityScore; // Trust the builder's assessment over heuristics
+  }
+
+  // Fallback heuristic for configs that don't have an embedded score (e.g., presets).
+  // Pre-built presets are known-good, well-tested designs → assign the aerospace standard quality.
+  const PRESET_NAMES = ["Simple Two-Stage", "Falcon 9 Inspired", "Three-Stage Heavy"];
+  if (PRESET_NAMES.includes(config.name)) {
+    return 0.82; // Known-good preset quality: ~6.3% Monte Carlo failure rate, realistic aerospace
+  }
+
+  // For custom configs without an embedded score (shouldn't happen with current builder,
+  // but could occur if the user somehow creates a config object directly), apply a modest
+  // quality based on the number of stages (more stages = more complex = slightly lower quality).
+  const stageCount = config.stages.length;
+  if (stageCount >= 3) return 0.70; // Three-stage: more staging events = more failure opportunities
+  if (stageCount === 2) return 0.75; // Two-stage: one staging event
+  return 0.78;                       // Single-stage: simple but limited Δv
+}
 
 /**
  * Deep-clone a rocket configuration object.
@@ -378,6 +490,21 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   // This ref is only used for detecting mid-flight manual intervention.
   const autoFlyManualOverrideRef = useRef<boolean>(false); // true = player took manual control
 
+  // ── SEPARATED STAGE REFS ──────────────────────────────────────────────────────
+  // Separated stages are rocket stages that have been jettisoned and are now
+  // independent physics objects falling back to Earth. They are tracked in refs
+  // (not React state) so the game loop can read/write them without re-render overhead.
+
+  // Array of all stages that have separated from the main vehicle this flight.
+  // Each entry is independently simulated: gravity + drag + parachute each frame.
+  // Cleared on reset and on rocket change (new flight = no prior separated stages).
+  const separatedStagesRef = useRef<SeparatedStageState[]>([]);
+
+  // Set of stageNumbers that were already separated at the start of each frame.
+  // Used to detect NEWLY separated stages: isSeparated && !prevSeparatedStageNumbers.has(stageNumber).
+  // Without this, the same stage would be detected as "newly separated" on every frame.
+  const prevSeparatedStageNumbersRef = useRef<Set<number>>(new Set());
+
   // ── REACT STATE (for DOM / UI rendering) ─────────────────────────────────────
 
   // Current rocket config used for the select box and reset logic.
@@ -385,6 +512,40 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   const [rocketConfig, setRocketConfig] = useState<MultiStageRocketConfig>(
     rocketConfigRef.current // Initially matches the ref
   );
+
+  // ── CUSTOM ROCKET SELECTOR STATE ──────────────────────────────────────────────
+  // These two state values manage the rocket-selector dropdown and its options.
+
+  // List of saved custom rockets loaded from localStorage.
+  // Populated on mount and refreshed when a custom rocket is saved/deleted.
+  // Each entry provides the id needed to load the full config from localStorage.
+  const [savedCustomRockets, setSavedCustomRockets] = useState<CustomRocketEntry[]>([]);
+
+  // The value currently selected in the rocket dropdown.
+  // For presets: value = preset name (e.g., "Simple Two-Stage")
+  // For custom: value = "custom:${id}" (e.g., "custom:1716518400000_MyFalcon9")
+  // For an active (just-launched) custom build: value = "custom:active"
+  // We store this separately from rocketConfig.name because custom configs may have
+  // the same name "Custom Build" but different ids, making name alone ambiguous.
+  const [selectedRocketKey, setSelectedRocketKey] = useState<string>(() => {
+    // Lazy initializer: compute the initial key based on initialConfig prop.
+    // If a custom config was passed from the builder, the key is "custom:active".
+    // If it's one of the 3 presets (or no config), the key is the preset name.
+    if (initialConfig) {
+      const presetNames = ["Simple Two-Stage", "Falcon 9 Inspired", "Three-Stage Heavy"];
+      // Check if the provided config is one of the known presets by name.
+      // If it IS a preset, use the preset name as the key so the select shows it correctly.
+      // If it is NOT (i.e., a custom build from the builder), use "custom:active".
+      return presetNames.includes(initialConfig.name) ? initialConfig.name : "custom:active";
+    }
+    // No initialConfig provided: start with Simple Two-Stage (the default shown on fresh load).
+    return rocketConfigRef.current.name; // Will be "Simple Two-Stage" (the default clone)
+  });
+
+  // Whether the "Manage Saved Rockets" modal is open.
+  // This modal shows the list of saved custom rockets with Delete buttons.
+  // Opened via a button next to the custom section in the dropdown.
+  const [showSaveManager, setShowSaveManager] = useState<boolean>(false);
 
   // Time multiplier shown on the time-control buttons.
   const [timeMultiplier, setTimeMultiplier] = useState<number>(1);
@@ -525,6 +686,33 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       canvasRef.current.height = canvasHeight; // Update drawing buffer height
     }
   }, [canvasWidth, canvasHeight]);
+
+  // ── CUSTOM ROCKET LOAD ON MOUNT ──────────────────────────────────────────────
+  // On mount, read saved custom rockets from localStorage and populate the dropdown.
+  // Also persist the initialConfig (if provided) to the active key so it survives
+  // page refreshes even before the user explicitly saves.
+  useEffect(() => {
+    // Step 1: Load the saved custom rockets list for the dropdown.
+    const rockets = loadCustomRocketsFromStorage(); // Read rocket_custom_list registry
+    setSavedCustomRockets(rockets); // Populate dropdown options with saved rockets
+    if (DEBUG_MODE) {
+      console.log("[RocketSimulator] Mount: loaded", rockets.length, "custom rockets from registry:", rockets);
+    }
+
+    // Step 2: If an initialConfig was provided (from builder launch), save it to
+    // rocket_custom_active so it persists after a page refresh.
+    // Without this, refreshing the page after launching from builder would revert to default.
+    if (initialConfig) {
+      try {
+        localStorage.setItem(ACTIVE_ROCKET_KEY, JSON.stringify(initialConfig));
+        if (DEBUG_MODE) {
+          console.log("[RocketSimulator] Mount: persisted initialConfig to active key:", initialConfig.name);
+        }
+      } catch (err) {
+        if (DEBUG_MODE) console.warn("[RocketSimulator] Mount: could not persist initialConfig:", err);
+      }
+    }
+  }, []); // Empty deps: run once on mount (reads are safe to do once at startup)
 
   // ── STAR FIELD GENERATION ────────────────────────────────────────────────────
   // Generate 300 stars once at mount. Stored in a ref so the game loop
@@ -1115,7 +1303,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         }
         updateParachute(parachuteRef.current, subDelta); // Inflate over time
 
-        // ── STAGE SEPARATION EFFECTS ─────────────────────────────────────
+        // ── STAGE SEPARATION EFFECTS + SEPARATED STAGE CREATION ─────────
         if (frame.state.didStageSeperateThisFrame) {
           // Burst of orange particles at separation point.
           particleSystemRef.current.createBurst(
@@ -1128,7 +1316,139 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           sepShakeTimerRef.current = 0.5; // Stage shake lasts 0.5 real seconds
           cameraRef.current.addShake(5);  // Immediate 5-pixel camera jolt
           if (step === 0) audioManagerRef.current.playSound("stage-separation");
+
+          // ── CREATE SEPARATED STAGE PHYSICS OBJECTS ──────────────────
+          // Loop through every stage in the config to find stages that are
+          // NEWLY separated this frame (isSeparated=true but not yet tracked).
+          // prevSeparatedStageNumbersRef tracks which stage indices we already
+          // know about — a stage is "new" the first frame isSeparated flips true.
+          config.stages.forEach((stage, idx) => {
+            // Condition: stage is marked separated AND we haven't seen it before.
+            // idx is used as the stage "number" for tracking (0-based index).
+            if (stage.isSeparated && !prevSeparatedStageNumbersRef.current.has(idx)) {
+              // Mark this stage as known so we don't create a duplicate next frame.
+              prevSeparatedStageNumbersRef.current.add(idx);
+
+              // Inherit the ROCKET's current position at separation.
+              // The separated stage starts at the same world location as the rocket.
+              const sepX = frame.state.position.x;
+              const sepY = frame.state.position.y;
+
+              // Inherit the rocket's current velocity, then add a small downward
+              // impulse to separate it from the ascending upper stage.
+              // 5 m/s downward is enough to visually diverge without being unrealistic.
+              const sepVx = frame.state.velocity.x;
+              const sepVy = frame.state.velocity.y - 5; // 5 m/s downward relative impulse
+
+              // Use the stage's dry mass (structural mass without fuel).
+              // At separation the stage has burned most of its fuel, so dry mass
+              // is a good approximation for the separated hardware's inertia.
+              const stageMass = stage.dryMass;
+
+              // Build the initial SeparatedStageState for this stage.
+              const newSeparated: SeparatedStageState = {
+                stageNumber:      idx,               // 0-based index matching config.stages
+                stageName:        stage.name ?? `Stage ${idx + 1}`, // Display name for the HUD
+                position:         { x: sepX, y: sepY }, // World position at separation
+                velocity:         { x: sepVx, y: sepVy }, // Velocity with downward impulse
+                mass:             Math.max(stageMass, 50),  // At least 50 kg to prevent NaN
+                parachute:        createParachute(50000, 1), // New single-use chute: min 50 km
+                parachuteDeployed: false,            // Not yet deployed
+                hasLanded:        false,             // Still in flight
+                landingVelocity:  0,                 // Set at touchdown
+                landingX:         0,                 // Set at touchdown
+              };
+
+              separatedStagesRef.current.push(newSeparated); // Add to tracked list
+
+              if (DEBUG_MODE) {
+                console.log(`[RocketSimulator] Separated stage created: idx=${idx} name="${newSeparated.stageName}" pos=(${sepX.toFixed(0)},${sepY.toFixed(0)}) vel=(${sepVx.toFixed(1)},${sepVy.toFixed(1)}) mass=${newSeparated.mass.toFixed(0)}kg`);
+              }
+            }
+          });
         }
+
+        // ── SEPARATED STAGE PHYSICS ──────────────────────────────────────
+        // Each separated stage is an independent ballistic object with:
+        //   - Gravity pulling it down
+        //   - Atmospheric drag slowing it (proportional to air density and velocity²)
+        //   - Parachute drag when deployed (auto-deploys when descending > 5 m/s)
+        //   - Euler integration at the same sub-step resolution as the main rocket
+        separatedStagesRef.current.forEach((sep) => {
+          if (sep.hasLanded) return; // Skip stages that have already touched down
+
+          // ── GRAVITY ─────────────────────────────────────────────────────
+          // Same gravitational model as the main physics engine: g = 9.81 m/s²
+          // downward (−y). Applied first before drag and parachute forces.
+          const gravity = -9.81; // m/s² downward in world-space y
+
+          // ── ATMOSPHERIC DRAG ────────────────────────────────────────────
+          // Simplified cylindrical drag: F_drag = 0.5 × ρ × v² × Cd × A
+          // Where: ρ = air density at current altitude (from ISA model)
+          //        v = speed of stage (scalar magnitude)
+          //        Cd = drag coefficient (1.0 for a tumbling cylinder)
+          //        A = cross-sectional area (0.5 m² placeholder for a typical stage)
+          const airDensity = getAirDensity(Math.max(sep.position.y, 0)); // kg/m³ at altitude
+          const velMag = Math.sqrt(sep.velocity.x ** 2 + sep.velocity.y ** 2); // Speed in m/s
+          const Cd = 1.0;  // Drag coefficient for a tumbling cylinder
+          const A = 0.5;   // Cross-sectional area in m² (rough estimate for a rocket stage)
+          // Drag magnitude: F_drag = 0.5 × ρ × v² × Cd × A
+          const dragMag = 0.5 * airDensity * velMag * velMag * Cd * A;
+          // Drag direction is always opposite to velocity.
+          // Guard against division by zero if velMag ≈ 0 (stage at rest in the air).
+          const dragAccX = velMag > 0.01 ? -(sep.velocity.x / velMag) * (dragMag / sep.mass) : 0;
+          const dragAccY = velMag > 0.01 ? -(sep.velocity.y / velMag) * (dragMag / sep.mass) : 0;
+
+          // ── PARACHUTE AUTO-DEPLOY ────────────────────────────────────────
+          // Deploy when descending faster than 5 m/s and above minimum altitude.
+          // Mirrors the main rocket's parachute logic.
+          if (
+            !sep.parachuteDeployed &&            // Only deploy once
+            sep.velocity.y < -5 &&              // Descending at > 5 m/s
+            sep.position.y > sep.parachute.minAltitudeForDeployment // Above minimum altitude
+          ) {
+            deployParachute(sep.parachute); // Begin inflation (gradual drag increase)
+            sep.parachuteDeployed = true;   // Flag so we don't call deploy again
+          }
+          updateParachute(sep.parachute, subDelta); // Inflate parachute over time
+
+          // ── PARACHUTE FORCE ──────────────────────────────────────────────
+          // Parachute drag acts upward when descending (reduces terminal velocity).
+          // LandingMechanics.Parachute stores a rated dragForce (Newtons at full inflation)
+          // and scales it by deploymentProgress² to model gradual inflation.
+          // Formula matches LandingMechanics.updateParachute: F = dragForce × progress²
+          let chuteAccY = 0;
+          if (sep.parachuteDeployed && sep.velocity.y < 0) {
+            // Only applies upward when descending; ignore during ascent
+            // Use progress² so drag builds up as the canopy opens (same as main physics)
+            const chuteForce = sep.parachute.dragForce * (sep.parachute.deploymentProgress ** 2);
+            chuteAccY = chuteForce / sep.mass; // Upward deceleration: a = F / m
+          }
+
+          // ── INTEGRATE ───────────────────────────────────────────────────
+          // Euler integration: new velocity = old velocity + acceleration × dt
+          // Acceleration = gravity + drag + parachute
+          sep.velocity.x += dragAccX * subDelta;                    // X: only drag (no lateral gravity)
+          sep.velocity.y += (gravity + dragAccY + chuteAccY) * subDelta; // Y: gravity + drag + chute
+
+          // New position = old position + velocity × dt
+          sep.position.x += sep.velocity.x * subDelta;
+          sep.position.y += sep.velocity.y * subDelta;
+
+          // ── LANDING DETECTION ────────────────────────────────────────────
+          // Stage touches down when it crosses y = 0 (ground level)
+          if (sep.position.y <= 0) {
+            sep.position.y   = 0;                        // Clamp to ground
+            sep.hasLanded    = true;                     // Stop physics updates
+            sep.landingVelocity = Math.abs(sep.velocity.y); // Record impact speed
+            sep.landingX     = sep.position.x;           // Record landing X for display
+            sep.velocity.x   = 0;                        // Come to rest
+            sep.velocity.y   = 0;
+            if (DEBUG_MODE) {
+              console.log(`[RocketSimulator] Separated stage landed: "${sep.stageName}" at x=${sep.landingX.toFixed(0)}m, v=${sep.landingVelocity.toFixed(1)}m/s`);
+            }
+          }
+        });
 
         // ── LANDING DETECTION ────────────────────────────────────────────
         if (frame.groundImpact && !landingStateRef.current.hasTouchedDown) {
@@ -1291,6 +1611,84 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         currentAtmoDataRef.current.machNumber // NEW: Mach number for heating glow
       );
 
+      // 6b. Draw separated stage bodies falling back to Earth.
+      // Each stage is rendered as a small grey cylinder rectangle at its current
+      // world position, with a parachute canopy triangle drawn above it when deployed.
+      separatedStagesRef.current.forEach((sep) => {
+        // Convert world position to screen coords using the same camera as the main rocket.
+        const { x: sx, y: sy } = camera.worldToScreen(sep.position.x, sep.position.y, cw, ch);
+
+        // Skip stages that are off-screen to avoid wasting canvas draw calls.
+        // Off-screen: more than 200px outside the viewport on any edge.
+        if (sx < -200 || sx > cw + 200 || sy < -200 || sy > ch + 200) return;
+
+        // ── STAGE BODY ────────────────────────────────────────────────────
+        // Render as a small dark-grey filled rectangle (cylinder silhouette).
+        // Width = 8px, height = 16px in screen space regardless of zoom, so it's
+        // always visible but never dominates the viewport.
+        const bw = 8;  // Body width in screen pixels
+        const bh = 16; // Body height in screen pixels
+        ctx.save(); // Preserve canvas transform state
+        ctx.fillStyle = sep.hasLanded ? "#556677" : "#889aaa"; // Darker if landed
+        ctx.strokeStyle = "#aabbcc";
+        ctx.lineWidth = 1;
+        ctx.fillRect(sx - bw / 2, sy - bh / 2, bw, bh);   // Centered on screen pos
+        ctx.strokeRect(sx - bw / 2, sy - bh / 2, bw, bh); // Outline for visibility
+
+        // ── STAGE LABEL ──────────────────────────────────────────────────
+        // Small white text below the body: stage name + landing velocity if landed.
+        ctx.fillStyle = "rgba(180, 200, 220, 0.75)"; // Muted white
+        ctx.font = "9px monospace";
+        ctx.textAlign = "center";
+        if (sep.hasLanded) {
+          // Show landing velocity so players can assess how hard the stage hit.
+          ctx.fillText(`${sep.stageName} ${sep.landingVelocity.toFixed(0)} m/s`, sx, sy + bh / 2 + 11);
+        } else {
+          ctx.fillText(sep.stageName, sx, sy + bh / 2 + 11); // Just name while descending
+        }
+
+        // ── PARACHUTE CANOPY ─────────────────────────────────────────────
+        // Draw a coloured triangle above the stage body when the chute is deployed.
+        // Size scales with deploymentProgress (0 → 1) so it opens over ~1 second.
+        if (sep.parachuteDeployed && !sep.hasLanded) {
+          const progress = sep.parachute.deploymentProgress; // 0–1 inflation progress
+          const chuteW = 22 * progress; // Canopy base width grows as it inflates
+          const chuteH = 14 * progress; // Canopy height grows proportionally
+
+          // Draw the canopy as a triangle:
+          //   apex  = top-centre of the triangle (above the stage)
+          //   left  = bottom-left of the canopy spread
+          //   right = bottom-right of the canopy spread
+          const apexY  = sy - bh / 2 - chuteH - 4; // 4px gap above stage body
+          const baseY  = sy - bh / 2 - 4;           // Bottom of canopy aligns with gap
+
+          ctx.beginPath();
+          ctx.moveTo(sx, apexY);                 // Apex (top centre)
+          ctx.lineTo(sx - chuteW / 2, baseY);   // Bottom-left corner
+          ctx.lineTo(sx + chuteW / 2, baseY);   // Bottom-right corner
+          ctx.closePath();
+
+          // Fill: orange-white gradient tint to distinguish from rocket
+          ctx.fillStyle = `rgba(255, 200, 80, ${0.55 * progress})`; // Fades in with progress
+          ctx.fill();
+          ctx.strokeStyle = `rgba(255, 220, 120, ${0.8 * progress})`;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+
+          // Draw lines from canopy base corners down to the stage body (suspension lines)
+          ctx.strokeStyle = `rgba(255, 220, 120, ${0.4 * progress})`; // Faint orange lines
+          ctx.lineWidth = 0.5;
+          ctx.beginPath();
+          ctx.moveTo(sx - chuteW / 2, baseY); // Left base corner → stage body
+          ctx.lineTo(sx, sy - bh / 2);
+          ctx.moveTo(sx + chuteW / 2, baseY); // Right base corner → stage body
+          ctx.lineTo(sx, sy - bh / 2);
+          ctx.stroke();
+        }
+
+        ctx.restore(); // Restore canvas state (undo save)
+      });
+
       // 7. Extended telemetry HUD with atmospheric and structural readings.
       // Passes the full AtmosphericTelemetry bundle so the panel shows MACH, Q,
       // MAX-Q, G-force, structural integrity %, and stagnation temperature.
@@ -1392,81 +1790,64 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
   // ── EVENT HANDLERS (React UI) ─────────────────────────────────────────────
 
-  /** Reset the simulation to the pre-launch state. */
-  const handleReset = useCallback(() => {
-    // Clone the current rocket config fresh so all tanks are full again.
-    const freshConfig = cloneRocketConfig(rocketConfigRef.current);
-    resetAllStages(freshConfig); // Ensure all stages are reset to initial state
-
-    // Update the physics-active config ref immediately (the game loop will see this next tick).
+  // ─────────────────────────────────────────────────────────────────────────────
+  /**
+   * Shared rocket-switch logic used by both handleReset and handleRocketChange.
+   * Applies a new config to all game-state refs and resets all per-flight state.
+   * Extracted into a helper to avoid duplicating ~30 lines of reset code.
+   *
+   * @param freshConfig  Cloned, reset MultiStageRocketConfig ready for a new flight
+   * @param newKey       The select-box key to set (preset name or "custom:${id}")
+   */
+  const applyRocketSwitch = useCallback((
+    freshConfig: MultiStageRocketConfig,
+    newKey: string,
+  ) => {
+    // Update the physics-active config ref — the game loop reads this every frame
     rocketConfigRef.current = freshConfig;
+    setRocketConfig(freshConfig);         // Sync React state for dropdown display
+    setSelectedRocketKey(newKey);         // Update the select-box value
 
-    // Reset flight state: back to ground, no velocity, no rotation.
+    // Create a new flight state for the fresh config (rocket at launch pad, all zeros)
     const freshState = createMultiStageRocket(freshConfig);
     flightStateRef.current = freshState;
+    setDisplayFlightState({ ...freshState }); // Sync display state for UI overlays
 
-    // Sync fresh state to React for UI display.
-    setDisplayFlightState({ ...freshState });
-    setRocketConfig(freshConfig); // Update React state so the select box label stays correct
-
-    // Reset landing state.
+    // Reset landing mechanics for the new flight
     landingStateRef.current = createLandingState();
-    parachuteRef.current = createParachute(100000, 1); // New parachute (not used)
-    landingGearRef.current = createLandingGear(500000); // Fresh gear
-    parachuteDeployedRef.current = false; // Allow parachute deployment on new flight
+    parachuteRef.current = createParachute(100000, 1); // New single-use parachute
+    landingGearRef.current = createLandingGear(500000); // Fresh shock absorbers
+    parachuteDeployedRef.current = false; // Allow parachute deployment on the new flight
 
-    // Snap camera back to ground.
-    cameraRef.current.reset();
-
-    // Clear trajectory.
+    // Clear the old trajectory (previous flight) and landing results
     trajectoryBufferRef.current = [];
     setTrajectoryHistory([]);
     setLandingScore(null);
     setLandingState(createLandingState());
 
-    // Clear particles (no leftover exhaust from previous flight).
+    // Clear exhaust particles and snap camera to ground
     particleSystemRef.current.clear();
+    cameraRef.current.reset();
 
-    // Stop all audio and play a click confirmation.
+    // Stop all audio from the previous flight
     audioManagerRef.current.stopAllSounds();
-    audioManagerRef.current.playSound("ui-click");
     engineSoundPlayingRef.current = false;
 
-    // Reset performance monitor stats.
-    performanceMonitorRef.current.reset();
-    setShowFullscreenTrajectory(false);
-
-    // ── RESET NEW PHYSICS SYSTEMS ─────────────────────────────────────────
-    // Clear structural state — fresh 100% integrity for the new flight.
-    structuralStateRef.current = createStructuralState(); // New structural state
-
-    // Clear engine failures — reset history, stuck throttles, pump failures.
-    // Preserves the current difficulty setting the player selected.
-    resetEngineFailures(engineFailureStateRef.current); // Clears failure history
-
-    // Reset atmospheric telemetry bundle to ground-level defaults.
+    // Reset new physics systems (structure, engine failures, atmospheric telemetry)
+    structuralStateRef.current = createStructuralState();
+    resetEngineFailures(engineFailureStateRef.current);
     currentAtmoDataRef.current = {
-      machNumber: 0,            // Mach 0 on the pad
-      dynamicPressure: 0,       // Q = 0 on the pad
-      maxDynamicPressure: 0,    // No Max-Q recorded yet
-      maxQAltitude: 0,          // No Max-Q altitude recorded
-      currentGForce: 0,         // No G-force at rest
-      structuralIntegrity: 100, // Full integrity
-      stagnationTemperature: 288, // ~sea-level ambient temperature
+      machNumber: 0, dynamicPressure: 0, maxDynamicPressure: 0,
+      maxQAltitude: 0, currentGForce: 0, structuralIntegrity: 100,
+      stagnationTemperature: 288,
     };
+    prevDynamicPressureRef.current = 0;
+    maxQPassedRef.current = false;
+    maxQFlashTimerRef.current = 0;
+    warningBannersRef.current = [];
+    isStructuralFailureRef.current = false;
 
-    // Reset Max-Q tracking.
-    prevDynamicPressureRef.current = 0;  // No previous Q
-    maxQPassedRef.current = false;       // Max-Q not yet detected for new flight
-    maxQFlashTimerRef.current = 0;       // Clear any active flash timer
-
-    // Clear all warning banners from previous flight.
-    warningBannersRef.current = []; // Empty banner queue
-
-    // Clear structural failure latch — rocket is intact for the new flight.
-    isStructuralFailureRef.current = false; // No structural failure
-
-    // Reset mission log for the new flight.
+    // Reset mission log for the new flight
     missionLogRef.current = [];
     setMissionLog([]);
     loggedIgnitionRef.current  = false;
@@ -1475,97 +1856,172 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
     loggedParaRef.current      = false;
     prevStageSepRef.current    = 0;
 
-    // ── RESET AUTO-FLY STATE ─────────────────────────────────────────────────
-    // Disengage the autopilot on reset — the player starts from scratch on the pad
-    // and should be in manual control by default. If they want auto-fly, they press F.
-    autoFlyEnabledRef.current = false;          // Disengage autopilot (game loop reads this)
-    autoFlyManualOverrideRef.current = false;   // Clear any manual override flag
-    autoFlyStartTimeRef.current = 0;            // Reset the T+0 reference time
-    autoFlyStatusRef.current = "MANUAL";        // HUD returns to manual mode label
-    setAutoFlyEnabled(false);                   // Sync React button state (re-renders button)
-
-    // Cancel any in-progress Monte Carlo simulation so it doesn't call setState
-    // on an unmounted or reset component. Then clear all MC UI state.
-    mcCancelRef.current?.();              // Abort the async simulation loop
-    mcCancelRef.current = null;           // Clear the stale cancel handle
-    setShowMCConfig(false);              // Close config panel if open
-    setShowMCPanel(false);               // Close results panel if open
-    setMCProgress(null);                 // Clear progress bar
-    // Note: we intentionally keep mcResults so the user can reopen the last
-    // results panel via "Monte Carlo Analysis" in the new landing modal.
-    // Clear playerTrajectoryRef so a fresh flight starts without the old comparison line.
-    playerTrajectoryRef.current = [];
-  }, []); // No deps — all game data accessed via refs
-
-  /** Switch to a different rocket type. */
-  const handleRocketChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
-    const name = e.target.value;
-
-    // "Build Custom" is not a preset — it asks App.tsx to switch to BUILD mode instead.
-    // onSwitchToBuildMode is the callback passed in as a prop from App.tsx.
-    if (name === "Build Custom") {
-      onSwitchToBuildMode?.(); // Optional chaining: safe to call even if prop is undefined
-      return;                   // Don't try to load a config for this virtual option
-    }
-
-    // Find the selected config constant.
-    let baseConfig: MultiStageRocketConfig | null = null;
-    if (name === "Simple Two-Stage")   baseConfig = ROCKET_SIMPLE_TWO_STAGE;
-    if (name === "Falcon 9 Inspired")  baseConfig = ROCKET_FALCON_9_INSPIRED;
-    if (name === "Three-Stage Heavy")  baseConfig = ROCKET_THREE_STAGE;
-    if (!baseConfig) return;
-
-    // Clone it so mutations don't corrupt the exported constants.
-    const freshConfig = cloneRocketConfig(baseConfig);
-    resetAllStages(freshConfig); // Ensure full tanks
-
-    // Update physics ref and React state.
-    rocketConfigRef.current = freshConfig;
-    setRocketConfig(freshConfig);
-
-    // Create a fresh flight state for the new rocket.
-    const freshState = createMultiStageRocket(freshConfig);
-    flightStateRef.current = freshState;
-    setDisplayFlightState({ ...freshState });
-
-    // Reset landing mechanics for the new rocket.
-    landingStateRef.current = createLandingState();
-    parachuteRef.current = createParachute(100000, 1);
-    landingGearRef.current = createLandingGear(500000);
-    parachuteDeployedRef.current = false;
-
-    // Clear old trajectory and landing results.
-    trajectoryBufferRef.current = [];
-    setTrajectoryHistory([]);
-    setLandingScore(null);
-    setLandingState(createLandingState());
-
-    // Clear particles and snap camera.
-    particleSystemRef.current.clear();
-    cameraRef.current.reset();
-
-    // Stop audio.
-    audioManagerRef.current.stopAllSounds();
-    audioManagerRef.current.playSound("ui-select");
-    engineSoundPlayingRef.current = false;
+    // Clear ALL separated stage tracking — this flight has no separated stages yet.
+    // Cleared here (not just on reset) so switching rockets mid-flight doesn't
+    // carry over separated stages from the previous rocket.
+    separatedStagesRef.current = [];          // Remove all tracked separated stages
+    prevSeparatedStageNumbersRef.current = new Set(); // Reset detection set
 
     performanceMonitorRef.current.reset();
 
-    // ── RESET NEW PHYSICS SYSTEMS on rocket change ──────────────────────
-    // A different rocket type means a clean new flight — reset all new systems.
-    structuralStateRef.current = createStructuralState(); // Fresh structure
-    resetEngineFailures(engineFailureStateRef.current);   // Clear failure history
-    currentAtmoDataRef.current = { // Reset atmospheric bundle to ground defaults
-      machNumber: 0, dynamicPressure: 0, maxDynamicPressure: 0,
-      maxQAltitude: 0, currentGForce: 0, structuralIntegrity: 100,
-      stagnationTemperature: 288,
-    };
-    prevDynamicPressureRef.current = 0;  // No previous Q
-    maxQPassedRef.current = false;       // Max-Q detection reset
-    maxQFlashTimerRef.current = 0;       // Clear flash timer
-    warningBannersRef.current = [];      // Clear all warning banners
-    isStructuralFailureRef.current = false; // Clear structural failure flag
-  }, []);
+    if (DEBUG_MODE) {
+      console.log(`[RocketSimulator] applyRocketSwitch: switched to "${freshConfig.name}" (key="${newKey}")`);
+    }
+  }, []); // No deps: reads all game data via refs and stable setState functions
+
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  /** Reset the simulation to the pre-launch state using the SAME rocket config. */
+  const handleReset = useCallback(() => {
+    // Clone the CURRENT rocket config so all tanks are full again.
+    // We use rocketConfigRef.current (not a preset constant) so a custom build
+    // stays as the active rocket after reset — it doesn't revert to Simple Two-Stage.
+    const freshConfig = cloneRocketConfig(rocketConfigRef.current);
+    resetAllStages(freshConfig); // Fill all tanks and clear staging flags
+
+    // applyRocketSwitch handles all the physics/state/ref resets; keep the same key
+    // so the dropdown stays on the current rocket (don't switch to a different name).
+    applyRocketSwitch(freshConfig, selectedRocketKey);
+
+    // Extras that applyRocketSwitch doesn't handle (reset-specific state):
+    setShowFullscreenTrajectory(false); // Close the fullscreen trajectory view if open
+
+    // Play a click confirmation after all sounds are stopped by applyRocketSwitch
+    audioManagerRef.current.playSound("ui-click");
+
+    // ── RESET AUTO-FLY STATE ─────────────────────────────────────────────────
+    // Disengage the autopilot on reset — the player starts from scratch on the pad
+    // and should be in manual control by default. If they want auto-fly, they press F.
+    autoFlyEnabledRef.current = false;        // Disengage autopilot (game loop reads this ref)
+    autoFlyManualOverrideRef.current = false; // Clear any previous manual override flag
+    autoFlyStartTimeRef.current = 0;          // Reset the T+0 reference time for auto-fly
+    autoFlyStatusRef.current = "MANUAL";      // HUD returns to "MANUAL" mode label
+    setAutoFlyEnabled(false);                 // Sync React button state so it re-renders
+
+    // ── CANCEL MONTE CARLO & CLEAR MC STATE ─────────────────────────────────
+    // Abort any in-progress simulation so it doesn't call setState after reset.
+    mcCancelRef.current?.();   // Abort the async simulation loop if one is running
+    mcCancelRef.current = null; // Clear the stale cancel handle
+    setShowMCConfig(false);    // Close MC config panel if open
+    setShowMCPanel(false);     // Close MC results panel if open
+    setMCProgress(null);       // Clear progress bar
+    // Note: intentionally keep mcResults so the user can reopen the last results panel.
+    playerTrajectoryRef.current = []; // Clear the gold comparison line for a fresh flight
+    if (DEBUG_MODE) console.log("[RocketSimulator] handleReset: reset complete");
+  }, [selectedRocketKey, applyRocketSwitch]); // Deps: selectedRocketKey (for key preservation), applyRocketSwitch
+
+  /** Switch to a different rocket type (preset or saved custom). */
+  const handleRocketChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
+    const key = e.target.value; // The select value (preset name, "custom:${id}", or "Build Custom")
+
+    if (DEBUG_MODE) console.log(`[RocketSimulator] handleRocketChange: key="${key}"`);
+
+    // "Build Custom" is not a rocket: it asks App.tsx to switch to BUILD mode.
+    if (key === "Build Custom") {
+      onSwitchToBuildMode?.(); // Optional chaining: safe even if prop is undefined
+      return;                   // Don't try to load a config for this virtual option
+    }
+
+    // ── HANDLE CUSTOM ROCKETS ───────────────────────────────────────────────
+    // Custom rockets are identified by keys starting with "custom:".
+    // The suffix after "custom:" is either the id or "active".
+    if (key.startsWith("custom:")) {
+      const idPart = key.substring(7); // Remove the "custom:" prefix to get id or "active"
+      let loadedConfig: MultiStageRocketConfig | null = null;
+
+      if (idPart === "active") {
+        // Load from the active-launch key (the most recently launched custom config).
+        // Written by RocketBuilder.handleLaunch and by our own mount effect.
+        try {
+          const raw = localStorage.getItem(ACTIVE_ROCKET_KEY);
+          if (raw) {
+            loadedConfig = JSON.parse(raw) as MultiStageRocketConfig;
+            if (DEBUG_MODE) console.log(`[RocketSimulator] handleRocketChange: loaded active config "${loadedConfig.name}"`);
+          }
+        } catch (err) {
+          if (DEBUG_MODE) console.warn("[RocketSimulator] handleRocketChange: failed to load active config:", err);
+        }
+      } else {
+        // Load from a specific saved custom rocket's localStorage key.
+        try {
+          const storageKey = `${STORAGE_KEY_PREFIX}${idPart}`; // e.g., "rocket_custom_1716518400000_MyFalcon9"
+          const raw = localStorage.getItem(storageKey);
+          if (raw) {
+            loadedConfig = JSON.parse(raw) as MultiStageRocketConfig;
+            if (DEBUG_MODE) console.log(`[RocketSimulator] handleRocketChange: loaded saved config "${loadedConfig.name}" from "${storageKey}"`);
+          }
+        } catch (err) {
+          if (DEBUG_MODE) console.warn(`[RocketSimulator] handleRocketChange: failed to load custom id "${idPart}":`, err);
+        }
+      }
+
+      if (!loadedConfig) {
+        if (DEBUG_MODE) console.warn(`[RocketSimulator] handleRocketChange: no config found for key "${key}", ignoring`);
+        return; // Couldn't load config: don't change the rocket (keep current selection)
+      }
+
+      // Clone and reset the loaded config so the flight starts with full tanks.
+      // Cloning is essential: the loaded object is from localStorage and should not be mutated.
+      const freshConfig = cloneRocketConfig(loadedConfig);
+      resetAllStages(freshConfig); // Fill all fuel tanks, clear staging flags
+
+      applyRocketSwitch(freshConfig, key); // Apply the new config and reset all flight state
+      audioManagerRef.current.playSound("ui-select"); // Pleasant confirmation sound
+      return; // Done — custom rocket handling complete
+    }
+
+    // ── HANDLE PRESET ROCKETS ───────────────────────────────────────────────
+    // Find the matching preset constant by name.
+    let baseConfig: MultiStageRocketConfig | null = null;
+    if (key === "Simple Two-Stage")  baseConfig = ROCKET_SIMPLE_TWO_STAGE;
+    if (key === "Falcon 9 Inspired") baseConfig = ROCKET_FALCON_9_INSPIRED;
+    if (key === "Three-Stage Heavy") baseConfig = ROCKET_THREE_STAGE;
+    if (!baseConfig) {
+      if (DEBUG_MODE) console.warn(`[RocketSimulator] handleRocketChange: unknown preset key "${key}", ignoring`);
+      return; // Unknown key: ignore (shouldn't happen with controlled dropdown)
+    }
+
+    // Clone the preset constant so physics mutations (fuel burn) don't corrupt the exported module.
+    const freshConfig = cloneRocketConfig(baseConfig);
+    resetAllStages(freshConfig); // Ensure full tanks for the new flight
+
+    applyRocketSwitch(freshConfig, key); // Apply preset and reset all flight state
+    // applyRocketSwitch already resets engineSound, performanceMonitor, structuralState,
+    // engineFailures, atmoData, warningBanners, etc. — no duplication needed here.
+    audioManagerRef.current.playSound("ui-select"); // Confirmation sound
+  }, [onSwitchToBuildMode, applyRocketSwitch]); // Deps: mode-switch callback + shared reset helper
+
+  /** Delete a saved custom rocket from localStorage and refresh the in-memory list.
+   *  Called by the save-manager modal's delete button for each rocket entry. */
+  const handleDeleteCustomRocket = useCallback((id: string) => {
+    // Remove the per-config storage key so the config data is gone
+    const storageKey = `${STORAGE_KEY_PREFIX}${id}`; // e.g., "rocket_custom_1716518400000_MyFalcon9"
+    localStorage.removeItem(storageKey); // Delete the config JSON blob
+
+    // Read the current registry, filter out the deleted entry, and write it back.
+    // This keeps the dropdown in sync — the deleted rocket won't appear next time.
+    try {
+      const raw = localStorage.getItem(REGISTRY_KEY);
+      if (raw) {
+        const list = JSON.parse(raw) as CustomRocketEntry[]; // Deserialize the registry array
+        const updated = list.filter(r => r.id !== id);      // Remove the matching entry
+        localStorage.setItem(REGISTRY_KEY, JSON.stringify(updated)); // Write the pruned registry
+        setSavedCustomRockets(updated); // Sync React state so the dropdown re-renders immediately
+
+        // If the deleted rocket is currently selected, switch back to the first preset.
+        // Without this, the dropdown would show a key that no longer has a backing config.
+        if (selectedRocketKey === `custom:${id}`) {
+          const freshConfig = cloneRocketConfig(ROCKET_SIMPLE_TWO_STAGE);
+          resetAllStages(freshConfig); // Full tanks for the new flight
+          applyRocketSwitch(freshConfig, "Simple Two-Stage"); // Reset to the default preset
+        }
+
+        if (DEBUG_MODE) console.log(`[RocketSimulator] handleDeleteCustomRocket: deleted id="${id}", registry now has ${updated.length} entries`);
+      }
+    } catch (err) {
+      if (DEBUG_MODE) console.warn("[RocketSimulator] handleDeleteCustomRocket: registry update failed:", err);
+    }
+  }, [selectedRocketKey, applyRocketSwitch]); // Deps: selectedRocketKey (to detect if deleted rocket is active), applyRocketSwitch
 
   /** Handle goal selector change. */
   const handleGoalChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -1691,16 +2147,50 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       {/* Positioned absolutely over the canvas. Semi-transparent overlay. */}
       <div style={topBarStyle}>
 
-        {/* Rocket selector */}
+        {/* Rocket selector — value is selectedRocketKey (not rocketConfig.name) so custom
+            rockets (key="custom:id") display correctly even when the name doesn't match
+            any preset option value. */}
         <div style={controlGroupStyle}>
           <span>Rocket:</span>
-          <select value={rocketConfig.name} onChange={handleRocketChange} style={selectStyle}>
+          <select value={selectedRocketKey} onChange={handleRocketChange} style={selectStyle}>
+            {/* Built-in presets — keyed by name which matches the preset constant */}
             <option value="Simple Two-Stage">Simple Two-Stage</option>
             <option value="Falcon 9 Inspired">Falcon 9 Inspired</option>
             <option value="Three-Stage Heavy">Three-Stage Heavy</option>
-            {/* Sentinel option: selecting this calls onSwitchToBuildMode via handleRocketChange */}
+
+            {/* Active custom config: shown when the user just launched from the builder.
+                Only shown when selectedRocketKey is "custom:active" so it doesn't clutter
+                the list after a custom rocket has been explicitly saved and named. */}
+            {selectedRocketKey === "custom:active" && (
+              <option value="custom:active">
+                ★ {rocketConfig.name} (active)
+              </option>
+            )}
+
+            {/* Saved custom rockets loaded from localStorage at mount time.
+                Each entry has a unique id and a display name set in the builder. */}
+            {savedCustomRockets.map(r => (
+              <option key={r.id} value={`custom:${r.id}`}>
+                ★ {r.name} (custom)
+              </option>
+            ))}
+
+            {/* Sentinel option: selecting this triggers a mode-switch to BUILD mode
+                via handleRocketChange — not an actual loadable rocket */}
             <option value="Build Custom">⚙ Build Custom...</option>
           </select>
+
+          {/* Show "Manage" button only when there are saved custom rockets to manage.
+              Opens the save-manager modal where rockets can be deleted. */}
+          {savedCustomRockets.length > 0 && (
+            <button
+              onClick={() => setShowSaveManager(true)} // Open the save manager overlay
+              style={{ ...btnStyle(false), padding: "4px 7px", fontSize: "11px" }}
+              title="View and delete saved custom rockets"
+            >
+              ✎ Manage
+            </button>
+          )}
         </div>
 
         {/* Goal selector */}
@@ -2097,34 +2587,51 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             </label>
           </div>
 
-          {/* Failure probability slider — only shown when failures are enabled */}
-          {mcConfig.includeFailureScenarios && (
-            <div style={{ marginBottom: 14 }}>
-              <label style={{ fontSize: 12, display: "block", marginBottom: 4 }}>
-                Failure probability:{" "}
-                <strong style={{ color: "#ffaa44" }}>
-                  {(mcConfig.failureProbability * 100).toFixed(0)}%
-                </strong>
-                {" "}(~{Math.round(mcConfig.numberOfRuns * mcConfig.failureProbability)} of {mcConfig.numberOfRuns} runs)
-              </label>
-              <input
-                type="range"
-                min="0"
-                max="0.2"       // 0% to 20% failure probability
-                step="0.01"     // 1% increments
-                value={mcConfig.failureProbability}
-                onChange={e => setMCConfig(prev => ({
-                  ...prev,
-                  failureProbability: parseFloat(e.target.value),
-                }))}
-                style={{ width: "100%", cursor: "pointer", accentColor: "#ff8844" }}
-              />
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, opacity: 0.5 }}>
-                <span>0% (no failures)</span>
-                <span>20% (1 in 5 fail)</span>
+          {/* Auto-calculated failure probability — read-only, derived from build quality.
+              Formula: failureProb = (1 - buildQualityScore) × 0.35
+              No manual slider: the probability is determined by rocket design quality.
+              High-quality builds (custom rockets with good design) have lower failure rates.
+              Preset rockets fall back to quality=0.82 → ~6.3% failure rate. */}
+          {mcConfig.includeFailureScenarios && (() => {
+            // Compute quality and failure probability at render time so they always
+            // reflect the CURRENT rocket (including any just-switched custom config).
+            const quality = computeBuildQuality(rocketConfigRef.current); // 0.30–0.95 for custom, 0.82 for presets
+            const autoFailureProb = (1 - quality) * 0.35;                 // Derived from design quality
+            const expectedFailures = Math.round(mcConfig.numberOfRuns * autoFailureProb); // For display
+
+            return (
+              <div style={{ marginBottom: 14, padding: "8px 10px", backgroundColor: "rgba(255,136,68,0.08)", borderRadius: 4, border: "1px solid rgba(255,136,68,0.25)" }}>
+                {/* Quality score row */}
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 5 }}>
+                  <span style={{ opacity: 0.7 }}>Build quality score:</span>
+                  <strong style={{ color: quality >= 0.8 ? "#44dd88" : quality >= 0.6 ? "#ffcc44" : "#ff6644" }}>
+                    {/* Color: green = good, yellow = marginal, red = poor */}
+                    {(quality * 100).toFixed(0)}%
+                  </strong>
+                </div>
+
+                {/* Failure probability row — read-only, derived from quality */}
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
+                  <span style={{ opacity: 0.7 }}>Auto failure probability:</span>
+                  <strong style={{ color: "#ffaa44" }}>
+                    {(autoFailureProb * 100).toFixed(1)}%
+                  </strong>
+                </div>
+
+                {/* Expected failures count */}
+                <div style={{ fontSize: 11, opacity: 0.55, marginTop: 3 }}>
+                  ~{expectedFailures} of {mcConfig.numberOfRuns} runs will include a failure scenario
+                </div>
+
+                {/* Explanation of how to improve quality */}
+                {quality < 0.75 && (
+                  <div style={{ fontSize: 10, opacity: 0.5, marginTop: 5, fontStyle: "italic" }}>
+                    Improve quality: add nose cone &amp; fins, fix thrust-to-weight ratio (1.3–3.0)
+                  </div>
+                )}
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Action buttons: Run or Cancel */}
           <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
@@ -2141,19 +2648,28 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
               onClick={() => {
                 setShowMCConfig(false); // Close config panel
 
-                // Initialize progress tracking
+                // Initialize progress tracking before the async batch starts
                 setMCProgress({ completed: 0, total: mcConfig.numberOfRuns });
 
                 // Clone the current rocket config so the MC simulation uses the same
-                // rocket the player just flew (not a stale reference from before reset)
+                // rocket the player just flew (not a stale reference from before reset).
                 const configForMC = cloneRocketConfig(rocketConfigRef.current);
+
+                // Auto-compute failure probability from build quality at launch time.
+                // This replaces the manual slider — quality score determines reliability.
+                // Formula: (1 - buildQuality) × 0.35  (higher quality → fewer failures)
+                const autoFailureProb = (1 - computeBuildQuality(rocketConfigRef.current)) * 0.35;
+
+                // Build the final MC config: override failureProbability with auto value.
+                // All other config fields (numberOfRuns, includeFailureScenarios) from mcConfig state.
+                const finalMCConfig = { ...mcConfig, failureProbability: autoFailureProb };
 
                 // Start the async Monte Carlo simulation.
                 // onProgress: called after each run to update the progress bar.
                 // onComplete: called with full results once all runs finish.
                 const { cancel } = runMonteCarloSimulation(
                   configForMC,
-                  mcConfig,
+                  finalMCConfig, // Use auto-computed failure probability, not the stale state value
                   (completed, total) => {
                     // Update progress bar — triggers re-render via React state
                     setMCProgress({ completed, total });
@@ -2166,7 +2682,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
                   }
                 );
 
-                // Store cancel handle so Reset can abort the simulation
+                // Store cancel handle so handleReset can abort the simulation mid-batch
                 mcCancelRef.current = cancel;
               }}
               style={{
@@ -2386,6 +2902,120 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             <div style={{ marginTop: "14px", fontSize: "10px", opacity: 0.5, textAlign: "center" }}>
               Press ? or ESC to close
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── SAVE MANAGER MODAL ───────────────────────────────────────────────────
+          Shows all saved custom rockets with delete buttons.
+          Opened by the "✎ Manage" button next to the rocket selector.
+          Clicking the backdrop or the Close button dismisses without changes. */}
+      {showSaveManager && (
+        <div
+          onClick={() => setShowSaveManager(false)} // Click backdrop to dismiss
+          style={{
+            position:        "fixed",
+            inset:           0,              // Cover the entire viewport
+            backgroundColor: "rgba(0,0,0,0.72)", // Dark semi-transparent backdrop
+            display:         "flex",
+            alignItems:      "center",
+            justifyContent:  "center",
+            zIndex:          100,            // Above all other overlays
+          }}
+        >
+          {/* Modal card — stopPropagation prevents backdrop click-through */}
+          <div
+            onClick={e => e.stopPropagation()} // Don't close when clicking inside the modal
+            style={{
+              backgroundColor: "rgba(5, 10, 28, 0.97)",
+              border:          `1px solid ${COLORS.ui}`,
+              borderRadius:    "6px",
+              padding:         "20px 24px",
+              minWidth:        "340px",
+              maxWidth:        "460px",
+              maxHeight:       "80vh",       // Scroll if many rockets saved
+              overflowY:       "auto",
+              fontFamily:      "monospace",
+              color:           COLORS.text,
+            }}
+          >
+            {/* Modal title */}
+            <h3 style={{ margin: "0 0 14px 0", fontSize: "14px", color: COLORS.ui }}>
+              Saved Custom Rockets ({savedCustomRockets.length})
+            </h3>
+
+            {/* List of saved rockets, each with a delete button */}
+            {savedCustomRockets.length === 0 ? (
+              // Empty state shown if all rockets were deleted during this session
+              <div style={{ fontSize: "12px", opacity: 0.5, textAlign: "center", padding: "16px 0" }}>
+                No saved rockets. Build and save one in the ⚙ builder.
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                {savedCustomRockets.map(r => (
+                  // Row per saved rocket: name + timestamp on the left, delete on the right
+                  <div
+                    key={r.id}
+                    style={{
+                      display:         "flex",
+                      justifyContent:  "space-between",
+                      alignItems:      "center",
+                      padding:         "8px 10px",
+                      backgroundColor: selectedRocketKey === `custom:${r.id}`
+                        ? "rgba(74,111,165,0.20)" // Highlight currently-active rocket
+                        : "rgba(255,255,255,0.03)",
+                      borderRadius:    "4px",
+                      border:          `1px solid rgba(74,111,165,0.2)`,
+                    }}
+                  >
+                    {/* Rocket info: name + save date */}
+                    <div>
+                      <div style={{ fontSize: "13px", fontWeight: "bold" }}>★ {r.name}</div>
+                      <div style={{ fontSize: "10px", opacity: 0.45 }}>
+                        {/* Convert timestamp to a human-readable save date */}
+                        Saved {new Date(r.timestamp).toLocaleDateString()} at {new Date(r.timestamp).toLocaleTimeString()}
+                      </div>
+                    </div>
+
+                    {/* Delete button — removes from localStorage and refreshes the list */}
+                    <button
+                      onClick={() => {
+                        handleDeleteCustomRocket(r.id); // Remove from storage + state
+                        // If this was the last rocket, close the modal automatically
+                        if (savedCustomRockets.length === 1) setShowSaveManager(false);
+                      }}
+                      style={{
+                        padding:         "4px 9px",
+                        backgroundColor: "rgba(180,40,40,0.25)", // Danger red tint
+                        color:           "#ff8888",
+                        border:          "1px solid rgba(180,40,40,0.5)",
+                        borderRadius:    "3px",
+                        cursor:          "pointer",
+                        fontSize:        "11px",
+                        fontFamily:      "monospace",
+                      }}
+                      title={`Delete "${r.name}" from saved rockets`}
+                    >
+                      ✕ Delete
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Close button at the bottom */}
+            <button
+              onClick={() => setShowSaveManager(false)} // Dismiss modal
+              style={{
+                ...btnStyle(false),
+                marginTop: "16px",
+                width:     "100%",
+                padding:   "7px 0",
+                textAlign: "center",
+              }}
+            >
+              Close
+            </button>
           </div>
         </div>
       )}

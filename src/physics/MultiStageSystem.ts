@@ -69,6 +69,16 @@ export interface MultiStageRocketConfig {
   name: string;         // Display name (e.g., "Falcon 9 Inspired")
   stages: RocketStage[]; // All stages bottom-to-top (stages[0] fires first)
   payloadMass: number;  // kg — non-propellant mass at the top (satellite, capsule)
+
+  // Optional build quality score (0.0 – 1.0) set by RocketBuilder when the config is created.
+  // This encodes how well-engineered the rocket is based on part compatibility, TWR margin,
+  // structural completeness (nose cone, fins, interstage adapters), and propellant consistency.
+  // The Monte Carlo system uses it to AUTO-CALCULATE failure probability:
+  //   failureProb = (1 - buildQualityScore) × 0.35
+  // so quality 0.95 → ~1.75% failures; quality 0.60 → ~14% failures.
+  // Pre-built presets have no value set (undefined) and the simulator falls back to a
+  // default quality of 0.82 (well-tested aerospace standard). Custom builds always set it.
+  buildQualityScore?: number;
 }
 
 // ─── FACTORY ──────────────────────────────────────────────────────────────────

@@ -63,8 +63,9 @@ import {
 import { AudioManager } from "../utils/AudioSystem";
 // AudioManager: Web Audio API wrapper; plays the assembly-complete rising tone
 
-import { COLORS } from "../utils/constants";
+import { COLORS, DEBUG_MODE } from "../utils/constants";
 // COLORS: shared color constants matching the rest of the simulator UI theme
+// DEBUG_MODE: when true, wraps console.log statements so save/load trace is visible in DevTools
 
 import { HologramViewer } from "./HologramViewer";
 // HologramViewer: renders a rotating 3D wireframe hologram of a rocket part on a canvas.
@@ -93,8 +94,27 @@ const ASSEMBLY_UPDATE_INTERVAL_MS = 50;
 // smooth enough visually without taxing the browser with too many setInterval callbacks
 
 const LOCALSTORAGE_KEY = "rocketBuilder_saves";
-// localStorage key under which saved rocket builds are stored as a JSON array;
-// must be unique to avoid collision with other app data
+// Legacy localStorage key for the BUILDER-SPECIFIC save format (stores part IDs so the builder
+// can reload the full assembly with all physical part objects looked up from the catalog).
+// This format is only useful inside the builder; the simulator cannot use it directly.
+
+const REGISTRY_KEY = "rocket_custom_list";
+// NEW: localStorage key for the SIMULATOR-ACCESSIBLE save registry.
+// Stores a JSON array of { id: string, name: string, timestamp: number } objects.
+// The simulator reads this on mount to populate the rocket-selector dropdown.
+// On each save, this array is updated atomically to add or overwrite an entry.
+
+const STORAGE_KEY_PREFIX = "rocket_custom_";
+// NEW: prefix for individual saved rocket configs in localStorage.
+// Full key = "rocket_custom_${id}" where id = "${timestamp}_${safeName}".
+// Example: "rocket_custom_1716518400000_MyFalcon9"
+// The simulator reads from this key when the user selects a custom rocket in the dropdown.
+
+const ACTIVE_ROCKET_KEY = "rocket_custom_active";
+// NEW: localStorage key for the MOST RECENTLY LAUNCHED custom config.
+// Written every time the user clicks "LAUNCH" from the builder.
+// Persists across page refreshes so the simulator opens with the same custom rocket.
+// The simulator reads this on mount if no initialConfig prop was provided.
 
 // ─── TYPES ────────────────────────────────────────────────────────────────────
 
@@ -298,6 +318,11 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
   // Whether the save/load panel is expanded (toggleable by button).
   const [showSavePanel, setShowSavePanel] = useState<boolean>(false);
 
+  // Save confirmation toast message: shown for 3 seconds after a successful save.
+  // null = hidden; non-null string = the message to display (e.g., "Rocket 'Falcon 9' saved!").
+  // We use a string (not boolean) so we can embed the rocket's name in the confirmation.
+  const [saveConfirmation, setSaveConfirmation] = useState<string | null>(null);
+
   // ── AUDIO ─────────────────────────────────────────────────────────────────
   // AudioManager: uses Web Audio API to play sound effects.
   // Created once and stored in a ref so the game loop can always access it.
@@ -317,7 +342,22 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
   useEffect(() => {
     const names = getSavedBuildNames(); // Read names from localStorage
     setSavedBuilds(names);             // Populate the saved builds list in state
+    if (DEBUG_MODE) console.log("[RocketBuilder] Mount: loaded saved build names from builder registry:", names);
   }, []); // Empty deps: run once on mount
+
+  // ── SAVE CONFIRMATION TOAST AUTO-DISMISS ───────────────────────────────────
+  // When a save confirmation message is set, start a 3-second countdown to clear it.
+  // This gives the user visual feedback ("Rocket 'X' saved!") without needing a modal.
+  // We clear on re-mount too because useEffect cleanup removes the timer.
+  useEffect(() => {
+    if (!saveConfirmation) return; // Nothing to dismiss: no timer needed
+    // Start a 3-second timer to auto-clear the confirmation message.
+    // 3 seconds is long enough to read but short enough not to clutter the UI.
+    const timer = setTimeout(() => {
+      setSaveConfirmation(null); // Clear the toast so it stops rendering
+    }, 3000); // 3000 ms = 3 seconds before the confirmation toast disappears
+    return () => clearTimeout(timer); // Cancel timer on unmount or if message changes
+  }, [saveConfirmation]); // Re-run whenever the confirmation message changes
 
   // ── ASSEMBLY TIMER EFFECT ─────────────────────────────────────────────────
   // When an assembly starts (assembly state transitions from null → AssemblyInProgress),
@@ -798,67 +838,163 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
    * the physics engine can simulate.
    * Returns null if the build is not valid (missing engines or fuel tanks).
    *
-   * @returns  Ready-to-fly MultiStageRocketConfig, or null if build is incomplete
+   * Also computes a buildQualityScore (0.0–1.0) based on design completeness.
+   * The quality score drives Monte Carlo failure probability: higher quality = fewer failures.
+   * Formula for MC: failureProb = (1 - buildQualityScore) × 0.35
+   *   quality 0.95 → ~1.75% failure rate (excellent design)
+   *   quality 0.82 → ~6.3%  failure rate (solid design, preset baseline)
+   *   quality 0.60 → ~14%   failure rate (poor design, many missing parts)
+   *
+   * @param rocketName  Optional name for the config (defaults to "Custom Build" if omitted)
+   * @returns  Ready-to-fly MultiStageRocketConfig with quality score embedded, or null if invalid
    */
-  const convertToConfig = useCallback((): MultiStageRocketConfig | null => {
-    // Validate that every stage has at least one engine and one tank
+  const convertToConfig = useCallback((rocketName?: string): MultiStageRocketConfig | null => {
+    // Validate that every stage has at least one engine and one tank.
+    // Without both, the physics engine can't compute burn rate or TWR.
     for (const stage of stages) {
       if (stage.engines.length === 0 || stage.fuelTanks.length === 0) {
-        return null; // Incomplete build: cannot simulate
+        return null; // Incomplete build: cannot simulate; button is disabled but guard anyway
       }
     }
 
-    // Also check propellant compatibility — refuse to launch with a type mismatch
+    // Also check propellant compatibility — refuse to launch with a type mismatch.
+    // In a real rocket, loading the wrong propellant would cause an immediate explosion.
+    // We block launch here because the physics engine would compute nonsensical burn rates.
     for (const stage of stages) {
       if (stage.engines.length > 0 && stage.fuelTanks.length > 0) {
         const engineProp = stage.engines[0].propellant; // First engine's propellant requirement
         for (const tank of stage.fuelTanks) {
-          if (tank.propellantType !== engineProp) return null; // Mismatch: cannot launch
+          if (tank.propellantType !== engineProp) return null; // Mismatch: block launch
         }
       }
     }
 
-    // Build the MultiStageRocketConfig stages array
+    // ── BUILD QUALITY SCORE COMPUTATION ──────────────────────────────────────
+    // Start at 1.0 (perfect) and deduct for each design deficiency.
+    // This score is used by Monte Carlo to auto-set failure probability —
+    // no manual slider needed. Better-built rockets fail less often.
+    let qualityScore = 1.0; // Start at 100% quality; deduct for design flaws below
+
+    // DEDUCTION: missing nose cone (-0.05)
+    // Nose cones reduce drag coefficient and shield the payload fairing.
+    // Without one, dynamic pressure is higher and structural loads are larger,
+    // increasing the risk of Max-Q-related failures and guidance problems.
+    const topStage = stages[stages.length - 1]; // The topmost stage (where nose cone goes)
+    if (!topStage.noseCone) qualityScore -= 0.05; // Aerodynamic penalty for no nose cone
+
+    // DEDUCTION: missing fins on bottom stage (-0.03)
+    // Fins provide passive aerodynamic stability (like feathers on an arrow).
+    // Without fins, the rocket needs active thrust vectoring to stay upright.
+    // More reliance on active guidance = more risk of guidance failure cascades.
+    if (!stages[0].fins) qualityScore -= 0.03; // Stability penalty for no fins
+
+    // DEDUCTION: missing interstage adapters (-0.04 each)
+    // Interstage adapters are the structural couplings between stages.
+    // Without them, staging can cause violent uncontrolled separation forces,
+    // which can damage the upper stage or create aerodynamic instabilities.
+    for (let qi = 0; qi < stages.length - 1; qi++) {
+      if (!stages[qi].interstageAdapter) {
+        qualityScore -= 0.04; // Structural penalty per missing interstage adapter
+      }
+    }
+
+    // DEDUCTION: marginal TWR (-0.15 if 1.0 ≤ TWR < 1.3)
+    // A TWR just above 1.0 means the rocket barely overcomes gravity.
+    // Engine thrust variation (±3% in Monte Carlo) could push effective TWR below 1.0,
+    // preventing liftoff entirely. Low TWR margin = high sensitivity to variances.
+    const stats = computeStats(); // Compute current stats to get TWR
+    if (stats.twr > 0 && stats.twr < 1.3) {
+      qualityScore -= 0.15; // Large penalty for dangerously low thrust margin
+    } else if (stats.twr > 3.0) {
+      // DEDUCTION: extremely high TWR (-0.03 if TWR > 3.0)
+      // Over-powered rockets hit Max-Q earlier and at higher speeds, increasing
+      // structural loads. Real rockets target TWR 1.2–1.8 for optimal reliability.
+      qualityScore -= 0.03; // Small penalty for over-powered design
+    }
+
+    // DEDUCTION: single-stage rocket (-0.08)
+    // Single-stage rockets carry empty tank mass all the way to apogee.
+    // They have no staging redundancy — if the one engine fails, the mission fails.
+    // Multi-stage designs are more reliable because each stage is purpose-optimized.
+    if (stages.length === 1) qualityScore -= 0.08; // Reliability penalty for no staging
+
+    // DEDUCTION: mixed propellants on same stage (-0.10 per mismatched case)
+    // Engines designed for RP-1/LOX cannot burn LH2. Mixed propellants on one stage
+    // would cause combustion instability and almost certain engine failure.
+    // This normally blocks launch (convertToConfig returns null earlier), but if
+    // somehow a mixed stage passes through, heavy-penalize the quality score.
+    for (const stage of stages) {
+      if (stage.engines.length > 0 && stage.fuelTanks.length > 0) {
+        const engineProp = stage.engines[0].propellant; // Expected propellant type
+        const hasMismatch = stage.fuelTanks.some(
+          (t) => t.propellantType !== engineProp // Any tank with wrong propellant
+        );
+        if (hasMismatch) qualityScore -= 0.10; // Heavy penalty for propellant incompatibility
+      }
+    }
+
+    // CLAMP quality to [0.30, 0.95]:
+    // 0.95 = even a perfect design has a small chance of random failure (Murphy's Law).
+    // 0.30 = even a terrible design has some chance of partial success.
+    qualityScore = Math.max(0.30, Math.min(0.95, qualityScore));
+
+    if (DEBUG_MODE) {
+      // Log all quality deductions to trace why the score is what it is
+      console.log(`[RocketBuilder] convertToConfig: quality score = ${qualityScore.toFixed(3)}`);
+      console.log(`[RocketBuilder] convertToConfig: TWR=${stats.twr.toFixed(2)}, stages=${stages.length}`);
+    }
+
+    // ── BUILD PHYSICS STAGES ──────────────────────────────────────────────
+    // Convert each BuildStage into a RocketStage for the physics engine.
     const configStages = stages.map((buildStage, i) => {
       // ── DRY MASS (everything except propellant) ──
+      // Sum of all structural components: engines, tank shells, fins, nose cone, etc.
+      // This is the mass the rocket has AFTER all fuel is burned (ejected).
       let dryMass = 0;
       for (const e of buildStage.engines) dryMass += e.mass;              // Engine dry masses
       for (const t of buildStage.fuelTanks) dryMass += t.dryMassKg;       // Empty tank structures
-      for (const r of buildStage.rcsThrusters) dryMass += r.mass;         // RCS thrusters
-      if (buildStage.fins) dryMass += buildStage.fins.mass;               // Fin set
-      if (buildStage.landingLegs) dryMass += buildStage.landingLegs.mass; // Landing legs
-      if (buildStage.interstageAdapter) dryMass += buildStage.interstageAdapter.mass; // Interstage adapter
-      if (buildStage.noseCone) dryMass += buildStage.noseCone.mass;       // Nose cone
-      dryMass = Math.max(dryMass, 1); // Minimum 1 kg dry mass to prevent division-by-zero
+      for (const r of buildStage.rcsThrusters) dryMass += r.mass;         // RCS thruster mass
+      if (buildStage.fins) dryMass += buildStage.fins.mass;               // Fin set mass
+      if (buildStage.landingLegs) dryMass += buildStage.landingLegs.mass; // Landing leg mass
+      if (buildStage.interstageAdapter) dryMass += buildStage.interstageAdapter.mass; // Adapter mass
+      if (buildStage.noseCone) dryMass += buildStage.noseCone.mass;       // Nose cone mass
+      dryMass = Math.max(dryMass, 1); // Minimum 1 kg to prevent division-by-zero in physics
 
       // ── FUEL CAPACITY (sum of all tank capacities) ──────────────────────
+      // The total propellant the stage carries at launch.
       const fuelCapacity = buildStage.fuelTanks.reduce((s, t) => s + t.capacityKg, 0);
 
       // ── COMBINED THRUST (all engines, sea-level) ────────────────────────
+      // With multiple engines in a cluster, thrusts add directly (all fire simultaneously).
       const engineThrust = computeTotalEngineThrust(buildStage.engines);
 
       // ── EFFECTIVE SPECIFIC IMPULSE (thrust-weighted average) ────────────
+      // When engines with different Isp values fire together, the effective Isp is
+      // the thrust-weighted harmonic mean (not a simple average).
       const specificImpulse = computeEffectiveIsp(buildStage.engines);
 
       // ── CREATE THE STAGE via the factory function ────────────────────────
-      // createRocketStage auto-calculates burnRate from thrust and Isp
+      // createRocketStage auto-calculates burnRate = thrust / (g₀ × Isp)
       return createRocketStage({
-        stageNumber: i,                          // 0 = first to fire, matching physics engine convention
-        name: `Stage ${i + 1}`,                 // Human-readable name for telemetry display
-        dryMass,                                  // kg — structural mass without propellant
-        fuelCapacity: Math.max(fuelCapacity, 1), // kg — propellant load (min 1 to avoid zero burn time)
-        engineThrust: Math.max(engineThrust, 1), // N — total thrust (min 1 to avoid zero TWR)
-        specificImpulse: Math.max(specificImpulse, 1), // s — effective Isp (min 1 to avoid zero burnRate)
+        stageNumber: i,                                  // 0 = first to fire (bottom)
+        name: `Stage ${i + 1}`,                         // Human-readable telemetry label
+        dryMass,                                          // kg — structural mass without propellant
+        fuelCapacity: Math.max(fuelCapacity, 1),         // kg — propellant (min 1 avoids zero burn)
+        engineThrust: Math.max(engineThrust, 1),         // N — total thrust (min 1 avoids zero TWR)
+        specificImpulse: Math.max(specificImpulse, 1),   // s — effective Isp (min 1 avoids zero burnRate)
       });
     });
 
-    // Build the complete config with the custom rocket name and a small payload
+    // ── RETURN COMPLETE CONFIG ────────────────────────────────────────────
+    // Embed the quality score so the Monte Carlo simulator can auto-set failure probability
+    // without needing a manual slider. The simulator reads buildQualityScore from this object.
     return {
-      name: "Custom Build",  // Name shown in the simulator HUD
-      stages: configStages,  // All assembled stages, bottom-to-top
-      payloadMass: PAYLOAD_MASS_KG, // 500 kg generic payload (satellite)
+      name: rocketName?.trim() || "Custom Build", // Use provided name or fallback to generic label
+      stages: configStages,                        // All stages, bottom-to-top
+      payloadMass: PAYLOAD_MASS_KG,                // 500 kg generic payload (satellite)
+      buildQualityScore: qualityScore,             // 0.3–0.95: drives MC failure probability
     };
-  }, [stages]); // Recompute when stages change
+  }, [stages, computeStats]); // Recompute when stages or stats computation changes
 
   // ─── SAVE / LOAD ─────────────────────────────────────────────────────────
 
@@ -880,47 +1016,124 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
   };
 
   /**
-   * Save the current build under the given name to localStorage.
-   * Overwrites any existing save with the same name.
+   * Save the current build under the given name to BOTH localStorage systems:
    *
-   * @param name  User-given name for this rocket configuration
+   * SYSTEM 1 (builder-specific): Saves part IDs to `rocketBuilder_saves` so the user
+   * can reload the full assembly in the builder (with all individual parts restored).
+   * This format stores part IDs only — the builder looks up full objects by ID from the catalog.
+   *
+   * SYSTEM 2 (simulator-accessible): Saves the complete MultiStageRocketConfig JSON to
+   * `rocket_custom_${id}` and updates the registry at `rocket_custom_list`.
+   * The simulator reads from this system to populate its rocket-selector dropdown.
+   * Immediately reads back the saved data to verify it was written correctly.
+   *
+   * @param name  User-given name for this rocket (used in both systems and the simulator dropdown)
    */
   const saveBuild = useCallback((name: string) => {
     if (!name.trim()) return; // Empty name: don't save (would create an unnamed entry)
 
+    // ── SYSTEM 1: BUILDER SAVE (part IDs for builder reload) ─────────────
     try {
-      // Build the save data object with part IDs (not full part objects)
+      // Build the save data object using PART IDs only (not full part objects).
+      // Storing IDs keeps the save small and allows part specs to be updated
+      // without invalidating existing saves — the catalog lookup handles the rest.
       const saveData: SavedBuild = {
-        name: name.trim(),                    // Trimmed name removes accidental leading/trailing spaces
-        savedAt: new Date().toISOString(),    // ISO timestamp for display in load list
-        stageCount: stages.length,            // Quick summary for the load list
+        name: name.trim(),                    // Trimmed name (no accidental whitespace)
+        savedAt: new Date().toISOString(),    // ISO timestamp for display in the load list
+        stageCount: stages.length,            // Quick stage count shown in the load list
         stages: stages.map((stage) => ({
-          engineIds: stage.engines.map((e) => e.id),           // Save only IDs, not full part objects
-          tankIds: stage.fuelTanks.map((t) => t.id),
-          rcsThrusterIds: stage.rcsThrusters.map((r) => r.id),
-          finId: stage.fins?.id ?? null,
-          landingLegId: stage.landingLegs?.id ?? null,
-          interstageAdapterId: stage.interstageAdapter?.id ?? null,
-          noseConeId: stage.noseCone?.id ?? null,
+          engineIds: stage.engines.map((e) => e.id),           // Engine part IDs
+          tankIds: stage.fuelTanks.map((t) => t.id),           // Fuel tank part IDs
+          rcsThrusterIds: stage.rcsThrusters.map((r) => r.id), // RCS thruster part IDs
+          finId: stage.fins?.id ?? null,                        // Fin ID or null if no fins
+          landingLegId: stage.landingLegs?.id ?? null,          // Landing leg ID or null
+          interstageAdapterId: stage.interstageAdapter?.id ?? null, // Adapter ID or null
+          noseConeId: stage.noseCone?.id ?? null,               // Nose cone ID or null
         })),
       };
 
-      // Load existing saves so we can merge (not overwrite the entire localStorage key)
+      // Load existing builder saves to merge (not overwrite the entire key atomically).
       const raw = localStorage.getItem(LOCALSTORAGE_KEY);
-      const existing: SavedBuild[] = raw ? JSON.parse(raw) : []; // Parse or empty array
+      const existing: SavedBuild[] = raw ? JSON.parse(raw) : []; // Parse existing or start empty
+      const filtered = existing.filter((s) => s.name !== name.trim()); // Remove same-name entry (overwrite)
+      filtered.push(saveData); // Append the new save at the end
+      localStorage.setItem(LOCALSTORAGE_KEY, JSON.stringify(filtered)); // Write atomically
+      setSavedBuilds(getSavedBuildNames()); // Refresh the displayed build names in state
 
-      // Remove any existing save with the same name (overwrite behavior)
-      const filtered = existing.filter((s) => s.name !== name.trim());
-      filtered.push(saveData); // Add the new save at the end
-
-      localStorage.setItem(LOCALSTORAGE_KEY, JSON.stringify(filtered)); // Persist to localStorage
-      setSavedBuilds(getSavedBuildNames()); // Refresh the displayed list
-      setSaveNameInput(""); // Clear the save name input field
-      audioRef.current.playSound("ui-select"); // Confirm save with a pleasant sound
-    } catch {
-      // localStorage unavailable (private browsing, quota exceeded): silently ignore
+      if (DEBUG_MODE) console.log(`[RocketBuilder] saveBuild (builder system): saved "${name}" to ${LOCALSTORAGE_KEY}`);
+    } catch (err) {
+      // localStorage unavailable (private browsing mode, storage quota exceeded, etc.):
+      // Silently fail — saving is nice-to-have, not required for launch to work.
+      if (DEBUG_MODE) console.warn("[RocketBuilder] saveBuild (builder system): localStorage write failed:", err);
     }
-  }, [stages]);
+
+    // ── SYSTEM 2: SIMULATOR SAVE (full MultiStageRocketConfig for dropdown) ──
+    // Convert the current build to a flyable config with the user-provided name embedded.
+    // This is the format the simulator can read and load directly into the physics engine.
+    const config = convertToConfig(name.trim()); // Pass name so config.name = user's name
+    if (!config) {
+      // Validation failed (should not happen since SAVE button requires valid build, but guard):
+      if (DEBUG_MODE) console.warn("[RocketBuilder] saveBuild (simulator system): convertToConfig returned null");
+      return;
+    }
+
+    try {
+      // Generate a unique ID for this save entry.
+      // Format: "${timestamp}_${sanitizedName}" — timestamp ensures uniqueness even if two
+      // rockets have the same name; sanitization removes characters that are invalid in
+      // localStorage keys (spaces, slashes, etc.) to avoid any parsing issues.
+      const timestamp = Date.now(); // Current unix timestamp in milliseconds
+      const safeName = name.trim().replace(/[^a-zA-Z0-9_-]/g, "_"); // Replace non-alphanumeric with _
+      const id = `${timestamp}_${safeName}`; // e.g., "1716518400000_MyFalcon9"
+      const storageKey = `${STORAGE_KEY_PREFIX}${id}`; // e.g., "rocket_custom_1716518400000_MyFalcon9"
+
+      // Step 1: Write the full MultiStageRocketConfig JSON to the per-rocket key.
+      // This stores the complete config so the simulator can load it fully on selection.
+      const configJson = JSON.stringify(config); // Serialize config to JSON string
+      localStorage.setItem(storageKey, configJson); // Persist the full config
+      if (DEBUG_MODE) console.log(`[RocketBuilder] saveBuild: wrote config to "${storageKey}" (${configJson.length} chars)`);
+
+      // Step 2: VERIFY the write by immediately reading it back.
+      // If the read fails or produces different data, the save is considered failed.
+      const readBack = localStorage.getItem(storageKey);
+      if (!readBack || readBack !== configJson) {
+        // Verification failed: the data wasn't stored correctly (quota limit, etc.)
+        if (DEBUG_MODE) console.error("[RocketBuilder] saveBuild: VERIFICATION FAILED — read-back mismatch!");
+        // Continue anyway (partial save is better than no save)
+      } else {
+        if (DEBUG_MODE) console.log("[RocketBuilder] saveBuild: verification passed — data matches");
+      }
+
+      // Step 3: Update the registry (rocket_custom_list) with the new entry.
+      // The registry is a JSON array of { id, name, timestamp } objects.
+      // The simulator reads this to know what custom rockets exist without loading all configs.
+      const existingRegistryRaw = localStorage.getItem(REGISTRY_KEY);
+      const existingRegistry: Array<{ id: string; name: string; timestamp: number }> =
+        existingRegistryRaw ? JSON.parse(existingRegistryRaw) : []; // Parse or start empty
+
+      // Remove any existing entry with the same name (overwrite same-name behavior).
+      // This ensures the dropdown shows only one entry per name (the most recent save).
+      const filteredRegistry = existingRegistry.filter((r) => r.name !== name.trim());
+      filteredRegistry.push({ id, name: name.trim(), timestamp }); // Add the new entry
+      localStorage.setItem(REGISTRY_KEY, JSON.stringify(filteredRegistry)); // Write registry atomically
+
+      if (DEBUG_MODE) {
+        console.log(`[RocketBuilder] saveBuild: updated registry "${REGISTRY_KEY}":`, filteredRegistry);
+      }
+
+      // Step 4: Show save confirmation toast.
+      // This gives the user visual feedback that their rocket was saved.
+      // The toast auto-dismisses after 3 seconds (see the saveConfirmation useEffect above).
+      setSaveConfirmation(`Rocket '${name.trim()}' saved successfully!`);
+      setSaveNameInput(""); // Clear the name input after successful save
+      audioRef.current.playSound("ui-select"); // Pleasant sound to confirm the save
+    } catch (err) {
+      // localStorage write failed: notify debug console but don't crash the UI.
+      if (DEBUG_MODE) console.error("[RocketBuilder] saveBuild (simulator system): write failed:", err);
+      // Show a failure toast so the user knows the save didn't work.
+      setSaveConfirmation(`Save failed — storage may be full or unavailable.`);
+    }
+  }, [stages, convertToConfig]); // Depends on stages (for saveData) and convertToConfig (for config)
 
   /**
    * Load a previously saved build by name.
@@ -978,14 +1191,53 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
 
   /**
    * Handle the LAUNCH button click.
-   * Converts the current build to a MultiStageRocketConfig and passes it to the parent.
+   * Converts the current build to a MultiStageRocketConfig and:
+   *   1. Saves it to localStorage `rocket_custom_active` so it persists across:
+   *      - Mode switches (BUILD ↔ FLY) without losing the config in App.tsx React state
+   *      - Page refreshes (the simulator reads this key on mount if no prop is provided)
+   *   2. Passes the config to App.tsx via the `onLaunch` callback, which sets mode to FLY
+   *
+   * This two-step persistence ensures the custom rocket flies correctly even if:
+   *   - React state batching causes unexpected render ordering
+   *   - The user refreshes the page before flying
+   *   - The user navigates away and back
    */
   const handleLaunch = useCallback(() => {
-    const config = convertToConfig(); // Try to convert build to config
-    if (!config) return; // Invalid build: button should be disabled, but guard anyway
-    audioRef.current.playSound("engine-ignition"); // Launch ignition sound
-    onLaunch(config); // Pass config to App.tsx which will switch to FLY mode
-  }, [convertToConfig, onLaunch]);
+    const config = convertToConfig(); // Convert current stages to physics-ready config
+    if (!config) return; // Invalid build: button is disabled, but guard against direct calls
+
+    // ── PERSIST TO ACTIVE ROCKET KEY ────────────────────────────────────────
+    // Write the config to localStorage BEFORE switching modes.
+    // This ensures the simulator can read it even if the React prop hasn't settled yet,
+    // and ensures it's available after a page refresh.
+    try {
+      localStorage.setItem(ACTIVE_ROCKET_KEY, JSON.stringify(config)); // Atomic write of full config
+      if (DEBUG_MODE) console.log(`[RocketBuilder] handleLaunch: saved config to "${ACTIVE_ROCKET_KEY}" (name: "${config.name}")`);
+
+      // VERIFY: Read back immediately to confirm the write succeeded.
+      // This catches rare localStorage failures (quota exceeded, private mode restrictions).
+      const readBack = localStorage.getItem(ACTIVE_ROCKET_KEY);
+      if (!readBack) {
+        if (DEBUG_MODE) console.warn("[RocketBuilder] handleLaunch: ACTIVE KEY VERIFICATION FAILED — read-back is null");
+      } else {
+        const parsedBack = JSON.parse(readBack) as MultiStageRocketConfig;
+        if (parsedBack.name !== config.name) {
+          if (DEBUG_MODE) console.warn("[RocketBuilder] handleLaunch: ACTIVE KEY MISMATCH — name differs after write");
+        } else {
+          if (DEBUG_MODE) console.log("[RocketBuilder] handleLaunch: active key verification passed");
+        }
+      }
+    } catch (err) {
+      // localStorage write failed: continue with the launch anyway.
+      // The config will still be passed via the onLaunch prop; localStorage is a backup.
+      if (DEBUG_MODE) console.error("[RocketBuilder] handleLaunch: localStorage write failed:", err);
+    }
+
+    // ── LAUNCH: SWITCH TO FLY MODE ─────────────────────────────────────────
+    audioRef.current.playSound("engine-ignition"); // Rising ignition sound cues the transition
+    onLaunch(config); // Calls App.tsx: setCustomConfig(config); setMode("FLY")
+    if (DEBUG_MODE) console.log("[RocketBuilder] handleLaunch: onLaunch called, switching to FLY mode");
+  }, [convertToConfig, onLaunch]); // Dependencies: convertToConfig builds the config; onLaunch triggers mode switch
 
   // ─── CATALOG HELPERS ─────────────────────────────────────────────────────
 
@@ -1727,6 +1979,28 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
             </div>
           </div>
 
+          {/* ── SAVE CONFIRMATION TOAST ── */}
+          {/* Appears for 3 seconds after a successful save, then auto-dismisses. */}
+          {/* Positioned ABOVE the Save/Load panel so it's always visible. */}
+          {saveConfirmation && (
+            <div style={{
+              marginBottom: "8px",
+              padding: "8px 10px",
+              backgroundColor: saveConfirmation.startsWith("Save failed")
+                ? "rgba(80,20,20,0.9)"    // Red background for failure
+                : "rgba(15,60,20,0.9)",   // Green background for success
+              border: `1px solid ${saveConfirmation.startsWith("Save failed") ? "#cc3333" : "#44aa44"}`,
+              borderRadius: "4px",
+              fontSize: "11px",
+              color: saveConfirmation.startsWith("Save failed") ? "#ff8888" : "#88ff88",
+              textAlign: "center",
+              animation: "none",          // No animation: simple appearance/disappearance
+            }}>
+              {/* Show checkmark for success, X for failure */}
+              {saveConfirmation.startsWith("Save failed") ? "✕ " : "✓ "}{saveConfirmation}
+            </div>
+          )}
+
           {/* ── SAVE / LOAD SECTION ── */}
           <div style={{ marginBottom: "12px" }}>
             <button
@@ -1749,12 +2023,12 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
 
             {showSavePanel && (
               <div style={{ padding: "8px", backgroundColor: "rgba(5,8,20,0.8)", border: "1px solid rgba(74,111,165,0.3)", borderRadius: "3px" }}>
-                {/* Save input + button */}
+                {/* Save name input field: user types the rocket's name here */}
                 <div style={{ display: "flex", gap: "4px", marginBottom: "8px" }}>
                   <input
                     type="text"
                     value={saveNameInput}
-                    onChange={(e) => setSaveNameInput(e.target.value)} // Update save name as user types
+                    onChange={(e) => setSaveNameInput(e.target.value)} // Live update as user types
                     placeholder="Rocket name..."
                     style={{
                       flex: 1,
@@ -1766,12 +2040,15 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
                       fontSize: "11px",
                       fontFamily: "monospace",
                     }}
-                    onKeyDown={(e) => { if (e.key === "Enter" && saveNameInput.trim()) saveBuild(saveNameInput); }}
-                    // Pressing Enter saves without needing to click the button
+                    onKeyDown={(e) => {
+                      // Pressing Enter triggers save without needing to click SAVE button.
+                      // Guard: only save when Enter is pressed AND a name has been typed.
+                      if (e.key === "Enter" && saveNameInput.trim()) saveBuild(saveNameInput);
+                    }}
                   />
                   <button
-                    onClick={() => saveBuild(saveNameInput)} // Trigger save
-                    disabled={!saveNameInput.trim()} // Disable if no name entered
+                    onClick={() => saveBuild(saveNameInput)} // Trigger save on button click
+                    disabled={!saveNameInput.trim()} // Disable when no name is entered
                     style={{
                       padding: "4px 8px",
                       backgroundColor: saveNameInput.trim() ? "rgba(15,60,20,0.8)" : "rgba(10,15,25,0.8)",
@@ -1787,17 +2064,24 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
                   </button>
                 </div>
 
-                {/* Saved builds list */}
+                {/* Hint text explaining that saved rockets appear in the simulator dropdown */}
+                <div style={{ fontSize: "9px", color: "#445566", marginBottom: "6px" }}>
+                  Saved rockets appear in the simulator's rocket selector as "★ Name (custom)"
+                </div>
+
+                {/* Saved builds list: LOAD and DELETE buttons for each saved rocket */}
                 {savedBuilds.length === 0 && (
                   <div style={{ fontSize: "10px", color: "#445566" }}>No saved rockets yet.</div>
                 )}
                 {savedBuilds.map((name) => (
                   <div key={name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "3px" }}>
+                    {/* Rocket name: truncated with ellipsis if too long */}
                     <span style={{ fontSize: "11px", color: "#aabbcc", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
                       {name}
                     </span>
+                    {/* LOAD button: rebuilds the assembly from saved part IDs */}
                     <button
-                      onClick={() => loadBuild(name)} // Load this saved rocket
+                      onClick={() => loadBuild(name)} // Reconstruct stages from saved part IDs
                       style={{
                         padding: "2px 6px",
                         backgroundColor: "rgba(15,25,55,0.9)",
