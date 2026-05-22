@@ -71,6 +71,10 @@ import { HologramViewer } from "./HologramViewer";
 // HologramViewer: renders a rotating 3D wireframe hologram of a rocket part on a canvas.
 // Used in the catalog tiles (thumbnail, auto-rotating) and in the assembly stack (static icon).
 
+import { RocketAssemblyPreview } from "./RocketAssemblyPreview";
+// RocketAssemblyPreview: canvas-based component that renders the assembled rocket as a
+// proportionally accurate 2D side-view, updating in real time as parts are added.
+
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
 const GRAVITY_MS2 = 9.81;
@@ -122,8 +126,9 @@ const ACTIVE_ROCKET_KEY = "rocket_custom_active";
  * Represents a single stage in the user's current build.
  * Stages are indexed 0 = bottom (fires first), increasing upward.
  * The physics engine will simulate them from stageIndex 0 upward.
+ * EXPORTED so RocketAssemblyPreview can consume the same type without redefinition.
  */
-interface BuildStage {
+export interface BuildStage {
   stageIndex: number;                    // 0 = first to fire (bottom), 1 = second, 2 = third
   engines: Engine[];                     // All engines attached to this stage (1–9)
   fuelTanks: FuelTank[];                 // All fuel tanks feeding engines in this stage
@@ -138,8 +143,9 @@ interface BuildStage {
  * Tracks the state of an in-progress part installation.
  * Assembly is a real-time countdown: the user must wait while the part
  * is "installed", simulating actual rocket assembly processes.
+ * EXPORTED so RocketAssemblyPreview can consume the same type without redefinition.
  */
-interface AssemblyInProgress {
+export interface AssemblyInProgress {
   part: AnyRocketPart;       // The part being assembled
   stageIndex: number;        // Which stage the part is being added to
   startTimeMs: number;       // Date.now() when assembly started; used to compute elapsed time
@@ -1515,145 +1521,6 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
     );
   };
 
-  /**
-   * Render one stage's part list in the center assembly view.
-   * Shows all installed parts as labelled colored blocks stacked vertically.
-   * The rocket is rendered from BOTTOM to TOP matching physical reality.
-   *
-   * @param stage   The BuildStage to render
-   * @param isTop   True if this is the topmost stage (where nose cone goes)
-   */
-  const renderStageVisual = (stage: BuildStage, isTop: boolean) => {
-    const isTarget = stage.stageIndex === targetStageIndex; // Highlight the currently-targeted stage
-
-    return (
-      <div
-        key={stage.stageIndex}
-        onClick={() => setTargetStageIndex(stage.stageIndex)} // Click stage to select it as target
-        style={{
-          border: `2px solid ${isTarget ? COLORS.trajectory : "rgba(74,111,165,0.3)"}`, // Bright border when selected
-          borderRadius: "4px",
-          padding: "6px",
-          marginBottom: "4px",
-          backgroundColor: isTarget ? "rgba(20,40,90,0.4)" : "rgba(10,15,30,0.4)", // Subtle highlight
-          cursor: "pointer",
-          fontSize: "11px",
-        }}
-      >
-        {/* Stage header row: label + remove button */}
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
-          <span style={{ color: COLORS.trajectory, fontWeight: "bold" }}>
-            {isTarget ? "▶ " : "  "}Stage {stage.stageIndex + 1} {isTarget ? "(active)" : ""}
-          </span>
-          {/* Only show the nose cone indicator on the top stage */}
-          {isTop && <span style={{ color: "#8899bb", fontSize: "10px" }}>← nose cone here</span>}
-        </div>
-
-        {/* ── NOSE CONE (top stage only) ── */}
-        {isTop && stage.noseCone && (
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "rgba(80,60,20,0.3)", borderRadius: "3px", padding: "3px 6px", marginBottom: "3px" }}>
-            {/* Small hologram icon next to the nose cone name in the assembly stack */}
-            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              <div style={{ transform: "scale(0.35)", transformOrigin: "left center", width: 35, height: 35, overflow: "hidden", flexShrink: 0 }}
-                onClick={(e) => e.stopPropagation()}>
-                {/* Scale-down wrapper: renders a 100×100 hologram shrunk to 35×35px via CSS transform */}
-                <HologramViewer partId={stage.noseCone.id} />
-              </div>
-              <span style={{ color: "#ddcc88" }}>▲ {stage.noseCone.name}</span>
-            </div>
-            <button
-              onClick={(e) => { e.stopPropagation(); removePart(stage.noseCone!, stage.stageIndex); }}
-              style={{ background: "none", border: "none", color: "#cc4444", cursor: "pointer", fontSize: "12px", padding: "0 2px" }}
-            >×</button>
-          </div>
-        )}
-
-        {/* ── RCS THRUSTERS ── */}
-        {stage.rcsThrusters.map((r, idx) => (
-          <div key={idx} style={{ display: "flex", justifyContent: "space-between", backgroundColor: "rgba(20,60,80,0.3)", borderRadius: "3px", padding: "3px 6px", marginBottom: "2px" }}>
-            <span style={{ color: "#88ccdd" }}>⊕ {r.name}</span>
-            <button
-              onClick={(e) => { e.stopPropagation(); removePart(r, stage.stageIndex); }}
-              style={{ background: "none", border: "none", color: "#cc4444", cursor: "pointer", fontSize: "12px", padding: "0 2px" }}
-            >×</button>
-          </div>
-        ))}
-
-        {/* ── FUEL TANKS ── */}
-        {stage.fuelTanks.map((t, idx) => (
-          <div key={idx} style={{ display: "flex", justifyContent: "space-between", backgroundColor: "rgba(20,50,80,0.4)", borderRadius: "3px", padding: "4px 6px", marginBottom: "2px", minHeight: "24px" }}>
-            <span style={{ color: "#88aadd" }}>◻ {t.name} ({fmtMass(t.capacityKg)})</span>
-            <button
-              onClick={(e) => { e.stopPropagation(); removePart(t, stage.stageIndex); }}
-              style={{ background: "none", border: "none", color: "#cc4444", cursor: "pointer", fontSize: "12px", padding: "0 2px" }}
-            >×</button>
-          </div>
-        ))}
-        {stage.fuelTanks.length === 0 && (
-          <div style={{ color: "#664444", fontSize: "10px", padding: "3px 6px", marginBottom: "2px" }}>
-            [No fuel tank — required]
-          </div>
-        )}
-
-        {/* ── ENGINES ── */}
-        {stage.engines.map((e, idx) => (
-          <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "rgba(60,25,15,0.5)", borderRadius: "3px", padding: "3px 6px", marginBottom: "2px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              {/* Tiny hologram icon for each engine in the assembly stack */}
-              <div style={{ transform: "scale(0.35)", transformOrigin: "left center", width: 35, height: 35, overflow: "hidden", flexShrink: 0 }}
-                onClick={(ev) => ev.stopPropagation()}>
-                <HologramViewer partId={e.id} />
-              </div>
-              <span style={{ color: "#ffaa66" }}>🔥 {e.name} ({fmtThrust(e.thrustSeaLevel)})</span>
-            </div>
-            <button
-              onClick={(ev) => { ev.stopPropagation(); removePart(e, stage.stageIndex); }}
-              style={{ background: "none", border: "none", color: "#cc4444", cursor: "pointer", fontSize: "12px", padding: "0 2px" }}
-            >×</button>
-          </div>
-        ))}
-        {stage.engines.length === 0 && (
-          <div style={{ color: "#664444", fontSize: "10px", padding: "3px 6px", marginBottom: "2px" }}>
-            [No engine — required]
-          </div>
-        )}
-
-        {/* ── FINS (bottom stage only) ── */}
-        {stage.stageIndex === 0 && stage.fins && (
-          <div style={{ display: "flex", justifyContent: "space-between", backgroundColor: "rgba(30,50,20,0.4)", borderRadius: "3px", padding: "3px 6px", marginBottom: "2px" }}>
-            <span style={{ color: "#88cc88" }}>↔ {stage.fins.name}</span>
-            <button
-              onClick={(e) => { e.stopPropagation(); removePart(stage.fins!, stage.stageIndex); }}
-              style={{ background: "none", border: "none", color: "#cc4444", cursor: "pointer", fontSize: "12px", padding: "0 2px" }}
-            >×</button>
-          </div>
-        )}
-
-        {/* ── LANDING LEGS (bottom stage only) ── */}
-        {stage.stageIndex === 0 && stage.landingLegs && (
-          <div style={{ display: "flex", justifyContent: "space-between", backgroundColor: "rgba(30,40,60,0.4)", borderRadius: "3px", padding: "3px 6px", marginBottom: "2px" }}>
-            <span style={{ color: "#aabb99" }}>⫠ {stage.landingLegs.name}</span>
-            <button
-              onClick={(e) => { e.stopPropagation(); removePart(stage.landingLegs!, stage.stageIndex); }}
-              style={{ background: "none", border: "none", color: "#cc4444", cursor: "pointer", fontSize: "12px", padding: "0 2px" }}
-            >×</button>
-          </div>
-        )}
-
-        {/* ── INTERSTAGE ADAPTER (between stages) ── */}
-        {stage.interstageAdapter && (
-          <div style={{ display: "flex", justifyContent: "space-between", backgroundColor: "rgba(40,30,60,0.4)", borderRadius: "3px", padding: "3px 6px", marginBottom: "2px" }}>
-            <span style={{ color: "#aa99cc" }}>↕ {stage.interstageAdapter.name}</span>
-            <button
-              onClick={(e) => { e.stopPropagation(); removePart(stage.interstageAdapter!, stage.stageIndex); }}
-              style={{ background: "none", border: "none", color: "#cc4444", cursor: "pointer", fontSize: "12px", padding: "0 2px" }}
-            >×</button>
-          </div>
-        )}
-      </div>
-    );
-  };
-
   // ─── MAIN RENDER ─────────────────────────────────────────────────────────
   return (
     <div style={containerStyle}>
@@ -1783,7 +1650,9 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
       </div>
 
       {/* ═══════════════════════════════════════════════════════════════
-           CENTER PANEL — ROCKET ASSEMBLY VISUAL (30% width)
+           CENTER PANEL — ROCKET ASSEMBLY PREVIEW (30% width)
+           Now rendered by RocketAssemblyPreview: a canvas-based component
+           that draws the rocket as a proportionally accurate 2D side-view.
           ═══════════════════════════════════════════════════════════════ */}
       <div style={{ ...panelBase, width: "30%", borderRight: "1px solid rgba(74,111,165,0.3)" }}>
 
@@ -1791,39 +1660,16 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
           ROCKET ASSEMBLY — {stages.length} STAGE{stages.length > 1 ? "S" : ""}
         </div>
 
-        {/* Scrollable rocket stack visual: rendered from top to bottom */}
-        {/* We reverse stages for display: top stage shown at top of column */}
-        <div style={{ flex: 1, overflowY: "auto", padding: "10px" }}>
-
-          {/* Arrow label at the top */}
-          <div style={{ textAlign: "center", fontSize: "11px", color: "#667799", marginBottom: "8px" }}>
-            ↑ UP (orbit direction)
-          </div>
-
-          {/* Render stages from TOP to BOTTOM (highest index first visually) */}
-          {[...stages].reverse().map((stage) =>
-            renderStageVisual(stage, stage.stageIndex === stages.length - 1)
-            // isTop = true only for the highest-indexed stage (last stage added)
-          )}
-
-          {/* Arrow label at the bottom */}
-          <div style={{ textAlign: "center", fontSize: "11px", color: "#667799", marginTop: "8px" }}>
-            ↓ GROUND (launch pad)
-          </div>
-        </div>
-
-        {/* Bottom decoration: launch pad indicator */}
-        <div style={{
-          flexShrink: 0,
-          padding: "6px",
-          backgroundColor: "rgba(10,12,20,0.9)",
-          borderTop: "1px solid rgba(74,111,165,0.2)",
-          textAlign: "center",
-          fontSize: "11px",
-          color: "#556677",
-        }}>
-          ≡≡≡≡≡≡≡≡≡≡≡ LAUNCH PAD ≡≡≡≡≡≡≡≡≡≡≡
-        </div>
+        {/* RocketAssemblyPreview fills the remaining height of the center panel.
+            It receives stages, assembly state, progress, and removal callback
+            so it can render the interactive live preview and handle part removal. */}
+        <RocketAssemblyPreview
+          stages={stages}
+          assembly={assembly}
+          assemblyProgress={assemblyProgress}
+          onRemovePart={removePart}
+          onRequestCatalogTab={(tab) => setActiveTab(tab as typeof activeTab)}
+        />
       </div>
 
       {/* ═══════════════════════════════════════════════════════════════
