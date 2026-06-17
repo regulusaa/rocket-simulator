@@ -1,0 +1,93 @@
+/*
+ * INDEX.CSS — GLOBAL BASE STYLES
+ * ================================
+ * These styles apply to every element on the page before any component-specific
+ * CSS runs. Think of this as the "reset layer" — it removes browser defaults
+ * that would otherwise cause layout surprises.
+ *
+ * LOADING ORDER:
+ *   1. Browser's built-in user-agent stylesheet (has defaults like margins, padding)
+ *   2. This file (index.css) — resets those defaults
+ *   3. App.css — component-level styles (currently unused)
+ *   4. Inline styles in React components (highest priority)
+ *
+ * WHY WE NEED A RESET:
+ *   Different browsers have different built-in styles. Chrome gives <body> 8px margins.
+ *   Firefox gives lists bullet points with different padding than Chrome.
+ *   Without a reset, the app would look slightly different across browsers.
+ *   By zeroing everything out first, we start from a known baseline.
+ */
+
+/*
+ * UNIVERSAL RESET (*) — Applies to every single HTML element.
+ *
+ * margin: 0       — Remove the default outer spacing browsers add to elements.
+ *                   <body> has 8px margins by default in Chrome. We remove them
+ *                   so the canvas truly fills the full 100vw × 100vh viewport.
+ *
+ * padding: 0      — Remove default inner spacing. <ul> and <ol> have padding
+ *                   that creates indented lists by default — we don't want that.
+ *
+ * box-sizing: border-box — CRITICAL for layout math.
+ *   Default (content-box): width=300 + padding=20 + border=2 → actual element is 322px wide
+ *   border-box:            width=300 includes the padding and border → still 300px wide
+ *   With border-box, "width: 100%" always means 100% of the container,
+ *   regardless of how much padding or border you add. Makes CSS much more predictable.
+ */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/*
+ * BODY DEFAULTS — Base styles for the page container.
+ *
+ * font-family: monospace — All text in the app uses a monospace (fixed-width) font.
+ *   This matches the "mission control terminal" aesthetic of the HUD.
+ *   Monospace fonts (Courier, Consolas, Monaco) are also better for displaying numbers
+ *   because every digit is the same width — so "100" and "999" align perfectly.
+ *   The component-level inline styles also set fontFamily: "monospace" in many places;
+ *   this body-level declaration is the fallback for elements that don't override it.
+ *
+ * background: #0a0e27 — Deep dark blue background color.
+ *   Value breakdown: 0a (red=10/255), 0e (green=14/255), 27 (blue=39/255).
+ *   This is very dark midnight blue — not pure black — which reduces eye strain
+ *   on dark screens while still looking like deep space.
+ *   Canvas elements sit ON TOP of this background; the canvas fills the viewport
+ *   so the body background is only visible for a split second on page load.
+ *
+ * color: #ffffff — Default text color is white.
+ *   Nearly all text in the app is white or near-white for legibility on the
+ *   dark background. Individual elements override this where needed (e.g., the
+ *   trajectory panel uses cyan #00ffff for labels).
+ */
+body {
+  font-family: monospace;
+  background: #0a0e27;
+  color: #ffffff;
+}
+
+/*
+ * CANVAS RENDERING — Pixel rendering hint for <canvas> elements.
+ *
+ * image-rendering: pixelated — Tells the browser to use nearest-neighbor scaling
+ *   when the CSS size of the canvas differs from its pixel buffer size.
+ *
+ * WHY THIS MATTERS:
+ *   Our canvas is sized to window.innerWidth × window.innerHeight in pixels.
+ *   React renders it with CSS width="100%" height="100%".
+ *   At 1:1 pixel ratio, there's no scaling — this rule does nothing.
+ *   On a 2× retina display (devicePixelRatio=2), the browser would normally
+ *   use bilinear interpolation to upscale the canvas, which blurs crisp lines.
+ *   With "pixelated", scaling stays sharp (no smoothing). This makes the rocket
+ *   outline and telemetry text appear crisp rather than blurry on high-DPI screens.
+ *
+ * NOTE: We do NOT scale the canvas buffer by devicePixelRatio — the simulator
+ *   targets fixed pixel sizes (e.g., 14px font) without HiDPI compensation.
+ *   If you wanted HiDPI support, you'd scale canvas.width = window.innerWidth * dpr
+ *   and use ctx.scale(dpr, dpr) — but that adds complexity not worth it here.
+ */
+canvas {
+  image-rendering: pixelated;
+}
