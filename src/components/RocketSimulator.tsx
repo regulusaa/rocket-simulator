@@ -778,11 +778,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   // Runs ONCE on mount (empty dependency array).
   // All game data is accessed via refs — no stale closures.
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
     let lastFrameTime = performance.now(); // Timestamp of the previous frame (ms)
     let frameCount = 0;                    // Total frames rendered since loop start
 
