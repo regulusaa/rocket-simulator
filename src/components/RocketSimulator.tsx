@@ -40,6 +40,12 @@ import type { MultiStageRocketState } from "../physics/engine";
 // TrajectoryPanel removed in favor of TelemetryDashboard
 import { ParticleSystem } from "../physics/ParticleSystem";
 
+import { Canvas } from '@react-three/fiber';
+import { SceneSetup } from './3d/SceneSetup';
+import { RocketMesh } from './3d/RocketMesh';
+import { ExhaustParticles } from './3d/ExhaustParticles';
+import { CameraRig } from './3d/CameraRig';
+
 import {
   createParachute,
   createLandingGear,
@@ -1925,12 +1931,9 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           inset:      0,
           overflow:   "hidden",
         }}
+        onClick={handleCanvasClick}
       >
-        <canvas
-          ref={canvasRef}
-          width={canvasWidth}
-          height={canvasHeight}
-          onClick={handleCanvasClick}
+        <Canvas
           style={{
             position: "absolute",
             top:      0,
@@ -1939,7 +1942,16 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             height:   "100%",
             cursor:   "crosshair",
           }}
-        />
+          camera={{ position: [0, 0, 100], fov: 45 }}
+        >
+          <SceneSetup flightStateRef={flightStateRef} />
+          <CameraRig flightStateRef={flightStateRef} />
+          <RocketMesh flightStateRef={flightStateRef} />
+          <ExhaustParticles 
+            flightStateRef={flightStateRef} 
+            configRef={rocketConfigRef} 
+          />
+        </Canvas>
 
 
       {/* ── LANDING RESULTS MODAL — centered overlay ────────────────────────── */}
