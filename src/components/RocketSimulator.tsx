@@ -83,27 +83,8 @@ import {
 
 import type { AltitudeGoal } from "../physics/types";
 
-import {
-  generateStars,
-  drawBackground,
-  drawStars,
-  drawGrid,
-  drawGround,
-  drawGoalLine,
-  drawRocket,
-  drawPerfStats,
-  drawMaxQFlash,
-  drawWarningBanner,
-  drawStructuralFailureOverlay,
-  drawAltitudeMarkers,
-  drawLandingTarget,
-  type Star,
-  type AtmosphericTelemetry, // NEW: data bundle passed to telemetry and rocket draw functions
-} from "../utils/drawHelpers";
-// drawMaxQFlash: large yellow "MAX-Q" callout shown for 2 seconds at peak dynamic pressure.
-// drawWarningBanner: red top-of-screen banner for engine failure and heating warnings.
 // drawStructuralFailureOverlay: full-screen red overlay when structural integrity hits 0%.
-// AtmosphericTelemetry: interface bundling Mach, Q, Max-Q, G-force, integrity, stagnation temp.
+// any: interface bundling Mach, Q, Max-Q, G-force, integrity, stagnation temp.
 
 // Import the three new physics systems.
 import {
@@ -383,7 +364,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   const audioManagerRef = useRef<AudioManager>(new AudioManager());
 
   // Star field: pre-generated at startup, read every frame for rendering.
-  const starsRef = useRef<Star[]>([]);
 
   // Trajectory buffer: raw position history accumulated between React state syncs.
   // We sync to React state every N frames rather than every frame to reduce re-renders.
@@ -411,7 +391,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
   // Latest computed atmospheric/structural telemetry bundle, updated every frame.
   // Written in the game loop and passed to drawTelemetry() and drawRocket() each frame.
-  const currentAtmoDataRef = useRef<AtmosphericTelemetry>({
+  const currentAtmoDataRef = useRef<any>({
     machNumber: 0,           // Mach number (0 at rest on pad)
     dynamicPressure: 0,      // Q in Pa (0 on pad)
     maxDynamicPressure: 0,   // Max Q reached so far (0 at start)
@@ -718,7 +698,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   // Generate 300 stars once at mount. Stored in a ref so the game loop
   // can read them each frame without triggering re-renders.
   useEffect(() => {
-    starsRef.current = generateStars(300); // 300 stars: enough density, not too many to draw
   }, []); // Only generate once — star positions are random but fixed per session
 
   // ── KEYBOARD EVENT LISTENERS ──────────────────────────────────────────────
@@ -811,10 +790,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       const now = performance.now();
       const rawDelta = Math.min((now - lastFrameTime) / 1000, 0.1); // Seconds, max 0.1 s
       lastFrameTime = now;
-
-      // Read the current canvas dimensions (may have changed via resize).
-      const cw = canvas.width;
-      const ch = canvas.height;
 
       // ── TIME MULTIPLIER ──────────────────────────────────────────────────
       // effectiveMult is 0 when paused (no physics), 1-10 otherwise.
@@ -1500,255 +1475,17 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         flightStateRef.current = frame.state;
       } // END physics sub-steps
 
-      // ── PARTICLES ────────────────────────────────────────────────────────
-      // Spawn exhaust particles at REAL time rate (not game-time rate).
-      // At 10× speed we don't want 10× the particles — cap spawn via probability.
-      const activeStage = rocketConfigRef.current.stages.find(
-        (s) => s.isActive && !s.isSeparated
-      );
-      if (activeStage && activeStage.isThrusting && activeStage.fuelMass > 0) {
-        // spawnChance: 1.0 at 1× speed, 0.1 at 10× speed — inversely proportional.
-        // At high time multipliers we generate fewer particles so the system doesn't
-        // accumulate thousands of long-lived smoke particles at once.
-        const spawnChance = Math.min(1, 1 / Math.max(1, effectiveMult));
-        if (Math.random() < spawnChance) {
-          // Spawn orange/yellow FLAME particles at the rocket's nozzle (world space).
-          particleSystemRef.current.createExhaustTrail(
-            flightStateRef.current.position.x,
-            flightStateRef.current.position.y,
-            flightStateRef.current.velocity.x,
-            flightStateRef.current.velocity.y,
-            flightStateRef.current.angle,
-            activeStage.thrustPercentage
-          );
-          // Spawn grey/white SMOKE particles on every 3rd frame (smoke is coarser than flame).
-          // Smoke particles live 3–4× longer than flame particles, so spawning less often
-          // keeps the particle budget balanced: ~3 smoke + ~10 flame per frame.
-          if (Math.random() < 0.35) {
-            particleSystemRef.current.createSmokeTrail(
-              flightStateRef.current.position.x,
-              flightStateRef.current.position.y,
-              flightStateRef.current.velocity.x,
-              flightStateRef.current.velocity.y,
-              flightStateRef.current.angle,
-              activeStage.thrustPercentage
-            );
-          }
-        }
-      }
-
-      // Update particles at REAL time speed (rawDelta), not game time.
-      // Particles are visual — they should always fade at wall-clock speed.
-      particleSystemRef.current.update(rawDelta);
-
       // ── WARNING BANNER TIMER DECAY (real time) ──────────────────────────
-      // Decrement each warning banner's remaining display time by the wall-clock delta.
-      // We use rawDelta (real seconds) not gameDelta so banners always fade at the
-      // same real-world speed regardless of the time multiplier the player has set.
       warningBannersRef.current = warningBannersRef.current
-        .map((w) => ({ ...w, timeLeft: w.timeLeft - rawDelta })) // Decrement each banner's timer
-        .filter((w) => w.timeLeft > 0); // Remove banners whose timers have expired
+        .map((w) => ({ ...w, timeLeft: w.timeLeft - rawDelta }))
+        .filter((w) => w.timeLeft > 0);
 
       // ── MAX-Q FLASH TIMER DECAY (real time) ─────────────────────────────
-      // Count down the Max-Q flash overlay timer toward 0.
-      // When it reaches 0 the flash stops rendering (drawMaxQFlash is not called).
       if (maxQFlashTimerRef.current > 0) {
-        maxQFlashTimerRef.current -= rawDelta; // Decrement at wall-clock speed
-      }
-
-      // ── CAMERA UPDATE ──────────────────────────────────────────────────
-      const state = flightStateRef.current;
-      const camera = cameraRef.current;
-
-      // Tell camera to follow the rocket's current position.
-      camera.setTarget(state.position.x, state.position.y);
-
-      // Set camera zoom based on current altitude.
-      camera.setTargetZoom(state.position.y);
-
-      // Engine vibration shake: subtle above 50% throttle.
-      if (activeStage && activeStage.thrustPercentage > 50) {
-        // Intensity: 0 px at 50% throttle, up to 2 px at 100% throttle.
-        const shakeIntensity = ((activeStage.thrustPercentage - 50) / 50) * 2;
-        camera.addShake(shakeIntensity);
-      }
-
-      // Stage-separation shake: persist the jolt for 0.5 real seconds.
-      if (sepShakeTimerRef.current > 0) {
-        sepShakeTimerRef.current -= rawDelta; // Countdown in real seconds
-        camera.addShake(4); // Strong shake during countdown
-      }
-
-      // Smooth zoom back to normal after landing.
-      if (state.hasLanded) {
-        camera.setTargetZoom(0); // Target zoom=1.0 (ground level)
-        // Also re-target to rocket's landing position so camera doesn't drift.
-        camera.setTarget(state.position.x, 0);
-      }
-
-      camera.update(rawDelta); // Lerp position/zoom, decay shake
-
-      // ── RENDER ────────────────────────────────────────────────────────────
-      performanceMonitorRef.current.startRenderTimer();
-
-      ctx.clearRect(0, 0, cw, ch); // Clear previous frame
-
-      // 1. Sky gradient (changes color with altitude).
-      drawBackground(ctx, cw, ch, state.position.y);
-
-      // 2. Parallax star field (only visible above ~5 km).
-      drawStars(ctx, starsRef.current, cw, ch, camera, state.position.y);
-
-      // 2b. World-space reference grid — faint lines at adaptive intervals.
-      // Drawn after stars so the grid sits in front of the star field but behind
-      // ground, rocket, and particles. Very low alpha keeps it unobtrusive.
-      drawGrid(ctx, cw, ch, camera);
-
-      // 3. Ground surface line at world Y=0.
-      drawGround(ctx, cw, ch, camera);
-
-      // 3a. Landing target bullseye circles centered on launch pad (x=0, y=0).
-      // Only visible when the camera can see the ground area.
-      drawLandingTarget(ctx, cw, ch, camera);
-
-      // 4. Exhaust particles and stage-separation burst.
-      particleSystemRef.current.draw(ctx, camera, cw, ch);
-
-      // 5. Goal altitude indicator line.
-      const goalAlt  = customGoalAltitudeRef.current ?? selectedGoalRef.current?.altitude ?? 0;
-      const goalName = customGoalAltitudeRef.current
-        ? "Custom"
-        : (selectedGoalRef.current?.name ?? "");
-      if (goalAlt > 0) drawGoalLine(ctx, cw, ch, camera, goalAlt, goalName);
-
-      // 6. Rocket body with aerodynamic heating glow at high Mach numbers.
-      // Pass currentMach from the latest atmospheric data so the glow renders
-      // at the correct intensity — orange at Mach 3, white-hot at Mach 5+.
-      drawRocket(
-        ctx, cw, ch, camera, state,
-        rocketConfigRef.current,
-        parachuteRef.current,
-        landingGearRef.current,
-        currentAtmoDataRef.current.machNumber // NEW: Mach number for heating glow
-      );
-
-      // 6b. Draw separated stage bodies falling back to Earth.
-      // Each stage is rendered as a small grey cylinder rectangle at its current
-      // world position, with a parachute canopy triangle drawn above it when deployed.
-      separatedStagesRef.current.forEach((sep) => {
-        // Convert world position to screen coords using the same camera as the main rocket.
-        const { x: sx, y: sy } = camera.worldToScreen(sep.position.x, sep.position.y, cw, ch);
-
-        // Skip stages that are off-screen to avoid wasting canvas draw calls.
-        // Off-screen: more than 200px outside the viewport on any edge.
-        if (sx < -200 || sx > cw + 200 || sy < -200 || sy > ch + 200) return;
-
-        // ── STAGE BODY ────────────────────────────────────────────────────
-        // Render as a small dark-grey filled rectangle (cylinder silhouette).
-        // Width = 8px, height = 16px in screen space regardless of zoom, so it's
-        // always visible but never dominates the viewport.
-        const bw = 8;  // Body width in screen pixels
-        const bh = 16; // Body height in screen pixels
-        ctx.save(); // Preserve canvas transform state
-        ctx.fillStyle = sep.hasLanded ? "#556677" : "#889aaa"; // Darker if landed
-        ctx.strokeStyle = "#aabbcc";
-        ctx.lineWidth = 1;
-        ctx.fillRect(sx - bw / 2, sy - bh / 2, bw, bh);   // Centered on screen pos
-        ctx.strokeRect(sx - bw / 2, sy - bh / 2, bw, bh); // Outline for visibility
-
-        // ── STAGE LABEL ──────────────────────────────────────────────────
-        // Small white text below the body: stage name + landing velocity if landed.
-        ctx.fillStyle = "rgba(180, 200, 220, 0.75)"; // Muted white
-        ctx.font = "9px monospace";
-        ctx.textAlign = "center";
-        if (sep.hasLanded) {
-          // Show landing velocity so players can assess how hard the stage hit.
-          ctx.fillText(`${sep.stageName} ${sep.landingVelocity.toFixed(0)} m/s`, sx, sy + bh / 2 + 11);
-        } else {
-          ctx.fillText(sep.stageName, sx, sy + bh / 2 + 11); // Just name while descending
-        }
-
-        // ── PARACHUTE CANOPY ─────────────────────────────────────────────
-        // Draw a coloured triangle above the stage body when the chute is deployed.
-        // Size scales with deploymentProgress (0 → 1) so it opens over ~1 second.
-        if (sep.parachuteDeployed && !sep.hasLanded) {
-          const progress = sep.parachute.deploymentProgress; // 0–1 inflation progress
-          const chuteW = 22 * progress; // Canopy base width grows as it inflates
-          const chuteH = 14 * progress; // Canopy height grows proportionally
-
-          // Draw the canopy as a triangle:
-          //   apex  = top-centre of the triangle (above the stage)
-          //   left  = bottom-left of the canopy spread
-          //   right = bottom-right of the canopy spread
-          const apexY  = sy - bh / 2 - chuteH - 4; // 4px gap above stage body
-          const baseY  = sy - bh / 2 - 4;           // Bottom of canopy aligns with gap
-
-          ctx.beginPath();
-          ctx.moveTo(sx, apexY);                 // Apex (top centre)
-          ctx.lineTo(sx - chuteW / 2, baseY);   // Bottom-left corner
-          ctx.lineTo(sx + chuteW / 2, baseY);   // Bottom-right corner
-          ctx.closePath();
-
-          // Fill: orange-white gradient tint to distinguish from rocket
-          ctx.fillStyle = `rgba(255, 200, 80, ${0.55 * progress})`; // Fades in with progress
-          ctx.fill();
-          ctx.strokeStyle = `rgba(255, 220, 120, ${0.8 * progress})`;
-          ctx.lineWidth = 1;
-          ctx.stroke();
-
-          // Draw lines from canopy base corners down to the stage body (suspension lines)
-          ctx.strokeStyle = `rgba(255, 220, 120, ${0.4 * progress})`; // Faint orange lines
-          ctx.lineWidth = 0.5;
-          ctx.beginPath();
-          ctx.moveTo(sx - chuteW / 2, baseY); // Left base corner → stage body
-          ctx.lineTo(sx, sy - bh / 2);
-          ctx.moveTo(sx + chuteW / 2, baseY); // Right base corner → stage body
-          ctx.lineTo(sx, sy - bh / 2);
-          ctx.stroke();
-        }
-
-        ctx.restore(); // Restore canvas state (undo save)
-      });
-
-      // Telemetry HUD rendering removed (now handled by React DOM TelemetryDashboard)
-
-      // 8. Max-Q flash overlay — shown for 2 seconds after peak dynamic pressure.
-      // Alpha is clamped to 1.0 at the start of the timer and fades as it counts down.
-      // Only drawn while the timer is positive (i.e., while the flash is active).
-      if (maxQFlashTimerRef.current > 0) {
-        const flashAlpha = Math.min(1.0, maxQFlashTimerRef.current); // Fade as timer → 0
-        drawMaxQFlash(ctx, cw, ch, flashAlpha); // Draw the "MAX-Q" callout text
-      }
-
-      // 9. Warning banners — stack from top, most recent shown first.
-      // Each banner has its own alpha derived from its remaining display time.
-      // We show up to 3 banners simultaneously (stacked 34px apart vertically).
-      const visibleBanners = warningBannersRef.current.slice(-3); // Show up to 3 most recent
-      visibleBanners.forEach((banner, idx) => {
-        // Alpha: fully opaque until last 1 second, then fades out.
-        const bannerAlpha = Math.min(1.0, banner.timeLeft); // 0–1 opacity
-        const yOffset = 50 + idx * 34; // Stack banners 34px apart, below top control bar
-        drawWarningBanner(ctx, cw, banner.message, bannerAlpha, yOffset);
-      });
-
-      // 10. Structural failure overlay — shown when integrity reaches 0%.
-      // Drawn on top of everything once latched (persists until Reset).
-      if (isStructuralFailureRef.current) {
-        drawStructuralFailureOverlay(ctx, cw, ch); // Red overlay with failure message
-      }
-
-      // 11a. Altitude markers ribbon on the right edge.
-      // Drawn after all world-space elements but before DOM-overlaid HUD elements.
-      drawAltitudeMarkers(ctx, cw, ch, camera);
-
-      // 11. Debug performance panel (top-left, toggle with P key).
-      // Drawn last so it appears on top of every other overlay.
-      if (showPerfStatsRef.current) {
-        drawPerfStats(ctx, performanceMonitorRef.current.getMetrics());
+        maxQFlashTimerRef.current -= rawDelta;
       }
 
       performanceMonitorRef.current.endRenderTimer();
-      performanceMonitorRef.current.setParticleCount(particleSystemRef.current.getParticleCount());
       performanceMonitorRef.current.setTrajectoryPointCount(trajectoryBufferRef.current.length);
       performanceMonitorRef.current.endFrame();
 
@@ -1834,8 +1571,8 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       // ── TRAJECTORY BUFFER ────────────────────────────────────────────────
       // Append current position to the raw buffer every frame.
       trajectoryBufferRef.current.push({
-        x: state.position.x,
-        y: state.position.y,
+        x: flightStateRef.current.position.x,
+        y: flightStateRef.current.position.y,
       });
 
       // Sync trajectory buffer to React state every 10 frames.
