@@ -109,6 +109,7 @@ export interface MissionSlice {
   difficulty: DifficultyLevel;
   isPaused: boolean;
   timeMultiplier: number;
+  cameraZoom: number;
 }
 
 export interface ChartDataSlice {
@@ -187,6 +188,7 @@ const initialMission: MissionSlice = {
   difficulty: 'normal',
   isPaused: false,
   timeMultiplier: 1,
+  cameraZoom: 1,
 };
 
 const initialChartData: ChartDataSlice = {

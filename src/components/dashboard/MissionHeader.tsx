@@ -247,6 +247,23 @@ export const MissionHeader: React.FC<MissionHeaderProps> = ({
 
         <div className="header__separator" />
 
+        {/* Zoom Control */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <span style={{ fontSize: '10px', color: '#aabbcc' }}>ZOOM</span>
+          <input 
+            type="range" 
+            min="0.2" 
+            max="3" 
+            step="0.1" 
+            value={mission.cameraZoom} 
+            onChange={(e) => useTelemetryStore.getState().updateMission({ cameraZoom: parseFloat(e.target.value) })}
+            style={{ width: '60px', accentColor: '#4a6fa5' }}
+            title="Camera Zoom"
+          />
+        </div>
+
+        <div className="header__separator" />
+
         {/* Audio controls */}
         <button
           className={`btn btn--sm ${audioMuted ? 'btn--active' : ''}`}

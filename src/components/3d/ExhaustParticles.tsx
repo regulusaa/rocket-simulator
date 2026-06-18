@@ -103,9 +103,12 @@ export const ExhaustParticles: React.FC<ExhaustParticlesProps> = ({ flightStateR
     }
     
     meshRef.current.instanceMatrix.needsUpdate = true;
-    if (meshRef.current.instanceColor) {
+    
+    if (!meshRef.current.geometry.hasAttribute('color')) {
       meshRef.current.geometry.setAttribute('color', new THREE.InstancedBufferAttribute(colorArray, 3));
-      meshRef.current.instanceColor.needsUpdate = true;
+    } else {
+      (meshRef.current.geometry.attributes.color as THREE.InstancedBufferAttribute).copyArray(colorArray);
+      meshRef.current.geometry.attributes.color.needsUpdate = true;
     }
   });
 

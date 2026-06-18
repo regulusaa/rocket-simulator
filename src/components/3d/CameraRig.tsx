@@ -2,6 +2,7 @@ import React from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
 import type { MultiStageRocketState } from '../../physics/engine';
+import { useTelemetryStore } from '../../store/telemetryStore';
 
 interface CameraRigProps {
   flightStateRef: React.MutableRefObject<MultiStageRocketState>;
@@ -9,6 +10,7 @@ interface CameraRigProps {
 
 export const CameraRig: React.FC<CameraRigProps> = ({ flightStateRef }) => {
   const { camera } = useThree();
+  const cameraZoom = useTelemetryStore((s) => s.mission.cameraZoom);
 
   useFrame(() => {
     const flight = flightStateRef.current;
@@ -20,8 +22,8 @@ export const CameraRig: React.FC<CameraRigProps> = ({ flightStateRef }) => {
     // As velocity increases, pull the camera back to convey speed and scale
     const speed = Math.sqrt(flight.velocity.x ** 2 + flight.velocity.y ** 2);
     const zoomOut = Math.min(speed * 0.15, 60); // Max zoom out is 60 units
-    const baseZ = 30; // Base distance from rocket
-    const targetZ = baseZ + zoomOut;
+    const baseZ = 30 * cameraZoom; // Base distance scaled by user zoom
+    const targetZ = baseZ + zoomOut * cameraZoom;
     
     // Max-Q Camera Shake (Simulate aerodynamic stress around 8k-25k meters)
     let shakeX = 0;

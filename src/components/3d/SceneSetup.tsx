@@ -1,7 +1,7 @@
 import React from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
-import { Stars } from '@react-three/drei';
+import { Stars, Cloud } from '@react-three/drei';
 import type { MultiStageRocketState } from '../../physics/engine';
 
 interface SceneSetupProps {
@@ -43,6 +43,12 @@ export const SceneSetup: React.FC<SceneSetupProps> = ({ flightStateRef }) => {
       
       {/* Stars in the background */}
       <Stars radius={300} depth={50} count={5000} factor={4} saturation={0} fade speed={1} />
+      
+      {/* Volumetric Clouds */}
+      <Cloud position={[-30, 40, -50]} speed={0.2} opacity={0.5} color="#ffffff" bounds={[20, 5, 20]} volume={10} />
+      <Cloud position={[40, 60, -80]} speed={0.1} opacity={0.6} color="#ffffff" bounds={[30, 10, 30]} volume={15} />
+      <Cloud position={[-60, 80, -100]} speed={0.15} opacity={0.4} color="#ffffff" bounds={[40, 10, 40]} volume={20} />
+      <Cloud position={[50, 30, -30]} speed={0.25} opacity={0.5} color="#ffffff" bounds={[15, 5, 15]} volume={8} />
       
       {/* Infinite Ground Plane */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.1, 0]} receiveShadow>
