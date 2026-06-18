@@ -1,0 +1,89 @@
+/*
+ * DESIGN TOKENS — Mission Control Dashboard
+ * ==========================================
+ * Central CSS custom properties that define the visual language
+ * for the SpaceX/Rocket Lab-style telemetry dashboard.
+ *
+ * All panel components reference these tokens so the entire theme
+ * can be adjusted from this single file.
+ */
+
+:root {
+  /* ── COLOR PALETTE ─────────────────────────────────────────── */
+
+  /* Background layers — deep space gradient */
+  --bg-void:         #040810;           /* Deepest black — behind canvas */
+  --bg-primary:      #080c1a;           /* Main background */
+  --bg-panel:        rgba(8, 14, 32, 0.82);   /* Panel surface */
+  --bg-panel-hover:  rgba(14, 22, 48, 0.88);  /* Hovered panel */
+  --bg-panel-active: rgba(18, 28, 58, 0.92);  /* Active/selected */
+  --bg-input:        rgba(6, 10, 24, 0.95);   /* Input/select fields */
+
+  /* Glass effects */
+  --glass-border:    rgba(50, 90, 160, 0.22);
+  --glass-border-hi: rgba(60, 120, 200, 0.35);
+  --glass-glow:      rgba(0, 140, 255, 0.06);
+  --glass-blur:      12px;
+
+  /* Accent colors — functional semantics */
+  --accent-cyan:     #00d4ff;       /* Primary accent — data labels, links */
+  --accent-blue:     #3388ff;       /* Secondary accent — interactive elements */
+  --accent-green:    #00ff88;       /* Success — GO, nominal, landed */
+  --accent-orange:   #ff8c00;       /* Caution — warnings, transonic */
+  --accent-red:      #ff3040;       /* Danger — failures, critical */
+  --accent-yellow:   #ffd000;       /* Attention — Max-Q, transonic */
+  --accent-purple:   #aa66ff;       /* Info — special events */
+
+  /* Dim versions for backgrounds/fills */
+  --accent-cyan-dim:   rgba(0, 212, 255, 0.12);
+  --accent-green-dim:  rgba(0, 255, 136, 0.10);
+  --accent-orange-dim: rgba(255, 140, 0, 0.10);
+  --accent-red-dim:    rgba(255, 48, 64, 0.10);
+
+  /* Text hierarchy */
+  --text-primary:    #e8eef8;       /* Main readable text */
+  --text-secondary:  #8899bb;       /* Labels, descriptions */
+  --text-tertiary:   #556688;       /* Hints, disabled */
+  --text-value:      #ffffff;       /* Data values (bright) */
+
+  /* ── TYPOGRAPHY ────────────────────────────────────────────── */
+  --font-mono:  'JetBrains Mono', 'Fira Code', 'SF Mono', 'Cascadia Code', monospace;
+  --font-sans:  'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+  /* Font sizes — modular scale */
+  --fs-xs:     10px;
+  --fs-sm:     11px;
+  --fs-base:   12px;
+  --fs-md:     14px;
+  --fs-lg:     18px;
+  --fs-xl:     24px;
+  --fs-2xl:    32px;
+  --fs-hero:   42px;
+
+  /* ── SPACING ───────────────────────────────────────────────── */
+  --space-xs:   4px;
+  --space-sm:   6px;
+  --space-md:   10px;
+  --space-lg:   14px;
+  --space-xl:   20px;
+
+  /* ── BORDER RADIUS ─────────────────────────────────────────── */
+  --radius-sm:  4px;
+  --radius-md:  6px;
+  --radius-lg:  10px;
+
+  /* ── SHADOWS ───────────────────────────────────────────────── */
+  --shadow-panel:    0 2px 20px rgba(0, 0, 0, 0.4), 0 0 1px rgba(50, 90, 160, 0.15);
+  --shadow-glow:     0 0 15px rgba(0, 180, 255, 0.08);
+  --shadow-inner:    inset 0 1px 3px rgba(0, 0, 0, 0.3);
+
+  /* ── TRANSITIONS ───────────────────────────────────────────── */
+  --transition-fast:   120ms ease-out;
+  --transition-normal: 200ms ease-out;
+  --transition-slow:   400ms ease-out;
+
+  /* ── DASHBOARD LAYOUT ──────────────────────────────────────── */
+  --sidebar-width:     272px;
+  --header-height:     44px;
+  --footer-height:     170px;
+}

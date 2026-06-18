@@ -30,10 +30,14 @@ import {
   updatePhysics,
   applyControls,
   calculateLandingScore,
+  getStageFuelStatus,
 } from "../physics/engine";
+
+import { useTelemetryStore } from "../store/telemetryStore";
+import { TelemetryDashboard } from "./dashboard/TelemetryDashboard";
 import type { MultiStageRocketState } from "../physics/engine";
 
-import { TrajectoryPanel } from "./TrajectoryPanel";
+// TrajectoryPanel removed in favor of TelemetryDashboard
 import { ParticleSystem } from "../physics/ParticleSystem";
 
 import {
@@ -64,9 +68,6 @@ import {
   WIND_SPEED,
   COLORS,
   ALTITUDE_GOALS,
-  INFO_PANEL_MARGIN,
-  TRAJECTORY_PANEL_WIDTH,
-  TRAJECTORY_PANEL_HEIGHT,
   DEBUG_MODE,
 } from "../utils/constants";
 
@@ -76,6 +77,8 @@ import {
   ROCKET_THREE_STAGE,
   type MultiStageRocketConfig,
   resetAllStages,
+  calculateTotalMass,
+  calculateTotalThrust,
 } from "../physics/MultiStageSystem";
 
 import type { AltitudeGoal } from "../physics/types";
@@ -88,7 +91,6 @@ import {
   drawGround,
   drawGoalLine,
   drawRocket,
-  drawTelemetry,
   drawPerfStats,
   drawMaxQFlash,
   drawWarningBanner,
@@ -565,7 +567,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   const [landingState,      setLandingState]      = useState<LandingState>(createLandingState());
 
   // Trajectory history for the trajectory panel component.
-  const [trajectoryHistory, setTrajectoryHistory] = useState<Array<{ x: number; y: number }>>([]);
 
   // Display copy of flight state — synced from flightStateRef every few frames.
   // Used by overlay UI that needs flight data (landing modal, etc.).
@@ -577,7 +578,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   const [showPerfStats, setShowPerfStats] = useState<boolean>(DEBUG_MODE);
 
   // Whether the fullscreen trajectory view is open.
-  const [showFullscreenTrajectory, setShowFullscreenTrajectory] = useState<boolean>(false);
 
   // ── MONTE CARLO STATE ─────────────────────────────────────────────────────
   // Controls visibility of the Monte Carlo configuration panel (pre-run setup).
@@ -628,7 +628,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   // React state is only used for the top-bar button appearance ("AUTO-FLY: ON/OFF").
   // The game loop reads autoFlyEnabledRef — never this React state — to avoid
   // stale closure issues inside the rAF callback.
-  const [autoFlyEnabled, setAutoFlyEnabled] = useState<boolean>(false);
   // autoFlyDisplayStatus is intentionally NOT stored in React state — the canvas
   // HUD reads autoFlyStatusRef.current directly inside the rAF loop, which is always
   // current without needing a React re-render cycle. The ref is the source of truth.
@@ -737,7 +736,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       else if (e.key === "0") { setIsPaused((p) => !p); } // Toggle pause
 
       // ── UI controls ──
-      if (e.key === "Escape") { setShowFullscreenTrajectory(false); setShowKeyboardHelp(false); }
       if (e.key === " ")      e.preventDefault(); // Prevent SPACEBAR from scrolling the page
       if (e.key === "p" || e.key === "P") setShowPerfStats((p) => !p); // Toggle perf stats
       if (e.key === "?" || e.key === "/") setShowKeyboardHelp((h) => !h); // Toggle help overlay
@@ -773,7 +771,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         }
 
         // Sync to React state so the top-bar button re-renders with the correct label.
-        setAutoFlyEnabled(newEnabled);
         audioManagerRef.current.playSound("ui-click"); // Audible confirmation click
       }
     };
@@ -888,7 +885,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             autoFlyEnabledRef.current = false;  // Disable the autopilot ref
             autoFlyManualOverrideRef.current = true; // Flag that player took over
             autoFlyStatusRef.current = "MANUAL"; // Update HUD to show manual mode
-            setAutoFlyEnabled(false);             // Sync React state for button display
             // Do NOT set spacebar = false here — pass the manual key through.
           } else if (!autoFlyManualOverrideRef.current) {
             // Auto-fly is active and no manual override. Compute autopilot commands.
@@ -1219,41 +1215,43 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
         // ── MISSION LOG EVENT DETECTION (first sub-step only) ────────────────
         if (step === 0) {
-          const t = frame.state.timeElapsed; // Current mission elapsed time (seconds)
+          const t = frame.state.timeElapsed;
+          const store = useTelemetryStore.getState();
 
-          // IGNITION: first time throttle goes above zero
+          // IGNITION
           const activeStgForLog = config.stages.find((s) => s.isActive && !s.isSeparated);
           if (!loggedIgnitionRef.current && activeStgForLog && activeStgForLog.thrustPercentage > 0) {
             loggedIgnitionRef.current = true;
-            missionLogRef.current.push({ time: t, message: "IGNITION" });
+            store.addMissionEvent({ time: t, message: "IGNITION", type: "ignition" });
           }
 
-          // LIFTOFF: first time rocket actually leaves the ground (upward velocity)
+          // LIFTOFF
           if (!loggedLiftoffRef.current && frame.state.isFlying && frame.state.velocity.y > 2) {
             loggedLiftoffRef.current = true;
-            missionLogRef.current.push({ time: t, message: "LIFTOFF" });
+            store.addMissionEvent({ time: t, message: "LIFTOFF", type: "liftoff" });
           }
 
-          // STAGING: detect new stage separations by comparing count
+          // STAGING
           if (frame.state.stageSeparationCount > prevStageSepRef.current) {
             const stageNum = frame.state.stageSeparationCount;
-            missionLogRef.current.push({ time: t, message: `STAGE ${stageNum} SEP` });
+            store.addMissionEvent({ time: t, message: `STAGE ${stageNum} SEP`, type: "staging" });
             prevStageSepRef.current = frame.state.stageSeparationCount;
           }
 
-          // MAX-Q PASSAGE: when maxQPassedRef flips to true
+          // MAX-Q
           if (!loggedMaxQRef.current && maxQPassedRef.current) {
             loggedMaxQRef.current = true;
             const qKpa = (currentAtmoDataRef.current.maxDynamicPressure / 1000).toFixed(1);
-            missionLogRef.current.push({ time: t, message: `MAX-Q ${qKpa} kPa` });
+            store.addMissionEvent({ time: t, message: `MAX-Q ${qKpa} kPa`, type: "maxq" });
           }
 
-          // PARACHUTE DEPLOY
+          // PARACHUTE
           if (!loggedParaRef.current && parachuteDeployedRef.current) {
             loggedParaRef.current = true;
-            missionLogRef.current.push({ time: t, message: "CHUTE DEPLOYED" });
+            store.addMissionEvent({ time: t, message: "CHUTE DEPLOYED", type: "parachute" });
           }
         }
+
 
         // ── AUDIO: ENGINE SOUNDS (only on first sub-step to avoid sound spam) ──
         if (step === 0) {
@@ -1468,6 +1466,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           // Sync landing results to React state (triggers UI re-render for landing modal).
           setLandingScore(score);
           setLandingState({ ...updatedLanding });
+          useTelemetryStore.getState().updateMission({ landingScore: score });
 
           // Snapshot the player's flight trajectory at the moment of landing.
           // We spread the buffer into a new array so this copy is independent —
@@ -1477,9 +1476,10 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
           // Log the touchdown event with landing velocity
           const landV = Math.abs(frame.state.landingVelocity).toFixed(1);
-          missionLogRef.current.push({
+          useTelemetryStore.getState().addMissionEvent({
             time: frame.state.timeElapsed,
             message: `TOUCHDOWN ${landV} m/s`,
+            type: "landing",
           });
 
           // Landing visual effects.
@@ -1710,18 +1710,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
         ctx.restore(); // Restore canvas state (undo save)
       });
 
-      // 7. Extended telemetry HUD with atmospheric and structural readings.
-      // Passes the full AtmosphericTelemetry bundle so the panel shows MACH, Q,
-      // MAX-Q, G-force, structural integrity %, and stagnation temperature.
-      const activeMult = isPausedRef.current ? 0 : timeMultiplierRef.current;
-      drawTelemetry(
-        ctx, cw, ch, state, rocketConfigRef.current,
-        activeMult, isPausedRef.current,
-        currentAtmoDataRef.current, // Atmospheric/structural telemetry bundle
-        autoFlyStatusRef.current    // Auto-fly mode string for the MODE: HUD row
-        // Reading directly from the ref (not React state) so the HUD always shows
-        // the current frame's phase without waiting for a React re-render cycle.
-      );
+      // Telemetry HUD rendering removed (now handled by React DOM TelemetryDashboard)
 
       // 8. Max-Q flash overlay — shown for 2 seconds after peak dynamic pressure.
       // Alpha is clamped to 1.0 at the start of the timer and fades as it counts down.
@@ -1763,14 +1752,83 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       performanceMonitorRef.current.setTrajectoryPointCount(trajectoryBufferRef.current.length);
       performanceMonitorRef.current.endFrame();
 
-      // ── SYNC TO REACT STATE (every 3 frames to reduce re-renders) ──────────
+      // ── SYNC TO REACT STATE & ZUSTAND STORE (every 3 frames) ──────────
       if (frameCount % 3 === 0) {
-        // Copy flight state to React state for overlay UI (landing modal, etc.).
         setDisplayFlightState({ ...flightStateRef.current });
+        const store = useTelemetryStore.getState();
+        const st = flightStateRef.current;
+        const atmo = currentAtmoDataRef.current;
+        const struct = structuralStateRef.current;
+        const config = rocketConfigRef.current;
+        const activeStage = config.stages.find(s => s.isActive && !s.isSeparated);
+        const activeStageIdx = config.stages.findIndex(s => s.isActive && !s.isSeparated);
 
-        // Sync auto-fly status string to React state so the HUD MODE row updates.
-        // The canvas HUD reads autoFlyStatusRef.current directly in the rAF loop —
-        // no React state sync needed for the canvas-drawn MODE row.
+        store.updateDynamics({
+          altitude: st.position.y,
+          velocityX: st.velocity.x,
+          velocityY: st.velocity.y,
+          speed: Math.sqrt(st.velocity.x**2 + st.velocity.y**2),
+          angle: st.angle,
+          angularVelocity: st.angularVelocity,
+          maxAltitude: st.maxAltitudeReached,
+          isFlying: st.isFlying,
+          hasLanded: st.hasLanded,
+          positionX: st.position.x,
+        });
+
+        store.updateEnvironment({
+          machNumber: atmo.machNumber,
+          dynamicPressureQ: atmo.dynamicPressure,
+          maxQ: atmo.maxDynamicPressure,
+          maxQAltitude: atmo.maxQAltitude,
+          stagnationTemp: atmo.stagnationTemperature,
+          currentGForce: struct.currentAccelerationG,
+        });
+
+        const stagesInfo = getStageFuelStatus(config);
+        const totalMass = calculateTotalMass(config);
+        const totalThrust = calculateTotalThrust(config);
+        store.updateVehicle({
+          structuralIntegrity: struct.structuralIntegrity,
+          throttlePercent: activeStage ? activeStage.thrustPercentage : 0,
+          stages: stagesInfo.map(s => {
+            const stg = config.stages.find(st => st.stageNumber === s.stageNumber);
+            return {
+              stageNumber: s.stageNumber,
+              name: s.name,
+              fuelPercent: s.fuelPercent,
+              isActive: s.isActive,
+              isSeparated: s.isSeparated,
+              isThrusting: stg ? stg.thrustPercentage > 0 : false,
+              thrustPercentage: stg ? stg.thrustPercentage : 0
+            };
+          }),
+          activeStage: activeStageIdx + 1,
+          totalMass: totalMass,
+          totalThrust: totalThrust,
+          twr: totalMass > 0 ? totalThrust / (totalMass * GRAVITY) : 0,
+          didBreakApart: isStructuralFailureRef.current
+        });
+
+        let phase: import('../store/telemetryStore').FlightPhase = 'PRELAUNCH';
+        if (isStructuralFailureRef.current) phase = 'STRUCTURAL_FAILURE';
+        else if (st.hasLanded) phase = 'LANDED';
+        else if (st.isFlying && st.velocity.y < -5) phase = 'DESCENDING';
+        else if (st.isFlying && st.velocity.y > 2) {
+          if (atmo.dynamicPressure > 10000 && atmo.dynamicPressure > atmo.maxDynamicPressure * 0.9) phase = 'MAX_Q';
+          else phase = 'ASCENDING';
+        }
+        else if (st.isFlying) phase = 'COASTING';
+
+        store.updateMission({
+          phase,
+          timeElapsed: st.timeElapsed,
+          autoFlyEnabled: autoFlyEnabledRef.current,
+          autoFlyPhase: autoFlyStatusRef.current,
+          difficulty: engineFailureStateRef.current.difficulty,
+          isPaused: isPausedRef.current,
+          timeMultiplier: timeMultiplierRef.current
+        });
       }
 
       // ── TRAJECTORY BUFFER ────────────────────────────────────────────────
@@ -1783,15 +1841,16 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       // Sync trajectory buffer to React state every 10 frames.
       // TrajectoryPanel reads from React state, so we need periodic syncs.
       if (frameCount % 10 === 0) {
-        const limited = trajectoryLimiterRef.current.limitTrajectory(
-          [...trajectoryBufferRef.current] // Pass a copy — limiter may truncate
+        trajectoryLimiterRef.current.limitTrajectory(          [...trajectoryBufferRef.current] // Pass a copy — limiter may truncate
         );
-        setTrajectoryHistory(limited);
-
-        // Sync mission log to React state (only if it has changed recently).
-        // We snapshot the last 8 entries — enough to show all key flight events.
-        const logSnapshot = missionLogRef.current.slice(-8);
-        setMissionLog([...logSnapshot]);
+        
+        useTelemetryStore.getState().pushChartPoint(
+          flightStateRef.current.timeElapsed,
+          Math.sqrt(flightStateRef.current.velocity.x**2 + flightStateRef.current.velocity.y**2),
+          flightStateRef.current.position.y,
+          currentAtmoDataRef.current.dynamicPressure,
+          structuralStateRef.current.currentAccelerationG
+        );
       }
 
       // Schedule next frame via rAF.
@@ -1842,7 +1901,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
     // Clear the old trajectory (previous flight) and landing results
     trajectoryBufferRef.current = [];
-    setTrajectoryHistory([]);
     setLandingScore(null);
     setLandingState(createLandingState());
 
@@ -1905,7 +1963,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
     applyRocketSwitch(freshConfig, selectedRocketKey);
 
     // Extras that applyRocketSwitch doesn't handle (reset-specific state):
-    setShowFullscreenTrajectory(false); // Close the fullscreen trajectory view if open
 
     // Play a click confirmation after all sounds are stopped by applyRocketSwitch
     audioManagerRef.current.playSound("ui-click");
@@ -1917,7 +1974,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
     autoFlyManualOverrideRef.current = false; // Clear any previous manual override flag
     autoFlyStartTimeRef.current = 0;          // Reset the T+0 reference time for auto-fly
     autoFlyStatusRef.current = "MANUAL";      // HUD returns to "MANUAL" mode label
-    setAutoFlyEnabled(false);                 // Sync React button state so it re-renders
 
     // ── CANCEL MONTE CARLO & CLEAR MC STATE ─────────────────────────────────
     // Abort any in-progress simulation so it doesn't call setState after reset.
@@ -2056,24 +2112,19 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
   /** Handle custom goal altitude input. */
   const handleCustomGoal = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = e.target.value;
-    if (val === "") {
-      setCustomGoalAltitude(null);           // Empty input clears custom goal
-      setSelectedGoal(ALTITUDE_GOALS[0]);    // Fall back to first preset
+    const val = parseFloat(e.target.value);
+    if (!isNaN(val) && val > 0) {
+      setCustomGoalAltitude(val);
+      setSelectedGoal(null);
     } else {
-      const alt = parseFloat(val);
-      if (!isNaN(alt) && alt > 0) {
-        setCustomGoalAltitude(alt);  // Store valid positive altitude
-        setSelectedGoal(null);       // Deselect preset when custom is entered
-      }
+      setCustomGoalAltitude(null);
+      setSelectedGoal(ALTITUDE_GOALS[0]);
     }
   }, []);
-
   /** Handle volume slider change. */
-  const handleVolumeChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const vol = parseFloat(e.target.value);
-    setMasterVolume(vol);
-    audioManagerRef.current.setMasterVolume(vol); // Apply to AudioManager immediately
+  const handleVolumeChange = useCallback((v: number) => {
+    setMasterVolume(v);
+    audioManagerRef.current.setMasterVolume(v);
   }, []);
 
   /** Handle canvas click to trigger a burst of thrust. */
@@ -2083,44 +2134,6 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
   // ── OVERLAY STYLE HELPERS ─────────────────────────────────────────────────
 
-  // Shared style for the semi-transparent top control bar.
-  const topBarStyle: React.CSSProperties = {
-    position:        "absolute",
-    top:             0,
-    left:            0,
-    right:           0,
-    display:         "flex",
-    flexWrap:        "wrap",
-    gap:             "8px",
-    alignItems:      "center",
-    padding:         "8px 12px",
-    backgroundColor: "rgba(5, 8, 25, 0.85)", // Dark semi-transparent
-    backdropFilter:  "blur(4px)",             // Frosted-glass effect
-    borderBottom:    `1px solid ${COLORS.ui}`,
-    fontFamily:      "monospace",
-    color:           COLORS.text,
-    fontSize:        "13px",
-    zIndex:          10,
-  };
-
-  // Shared style for all top-bar control groups.
-  const controlGroupStyle: React.CSSProperties = {
-    display:    "flex",
-    alignItems: "center",
-    gap:        "6px",
-  };
-
-  // Style for select/input controls in the top bar.
-  const selectStyle: React.CSSProperties = {
-    padding:         "4px 6px",
-    backgroundColor: "#0d1a35",
-    color:           COLORS.text,
-    border:          `1px solid ${COLORS.ui}`,
-    borderRadius:    "3px",
-    cursor:          "pointer",
-    fontSize:        "12px",
-    fontFamily:      "monospace",
-  };
 
   // Style for buttons in the top bar.
   const btnStyle = (active: boolean, accent?: string): React.CSSProperties => ({
@@ -2137,286 +2150,65 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
   // ── RENDER ───────────────────────────────────────────────────────────────
   return (
-    // Root container: fixed position filling the entire viewport, overflow hidden
-    // so the canvas never creates a scrollbar.
-    <div
-      style={{
-        position:   "fixed",  // Fixed removes it from normal flow
-        inset:      0,         // top/right/bottom/left all 0 — fills viewport
-        overflow:   "hidden",  // Prevent scrollbars from appearing
-        fontFamily: "monospace",
-        color:      COLORS.text,
+    <TelemetryDashboard
+      rocketName={rocketConfig.name}
+      onReset={handleReset}
+      onToggleAutoFly={() => {
+        const newEnabled = !autoFlyEnabledRef.current;
+        autoFlyEnabledRef.current = newEnabled;
+        if (newEnabled) {
+          autoFlyStartTimeRef.current = flightStateRef.current.timeElapsed;
+          autoFlyManualOverrideRef.current = false;
+          autoFlyStatusRef.current = "AUTO-FLY (Throttle Up)";
+        } else {
+          autoFlyStatusRef.current = "MANUAL";
+        }
+        audioManagerRef.current.playSound("ui-click");
       }}
+      onSetTimeMultiplier={(m) => { setTimeMultiplier(m); setIsPaused(false); }}
+      onTogglePause={() => setIsPaused((p) => !p)}
+      onToggleMute={() => {
+        const muted = audioManagerRef.current.toggleMute();
+        setAudioMuted(muted);
+      }}
+      onVolumeChange={handleVolumeChange}
+      audioMuted={audioMuted}
+      masterVolume={masterVolume}
+      onGoalChange={handleGoalChange}
+      onCustomGoalChange={handleCustomGoal}
+      selectedGoalName={selectedGoal?.name ?? "custom"}
+      customGoalAltitude={customGoalAltitude}
+      altitudeGoals={ALTITUDE_GOALS}
+      onRocketChange={handleRocketChange}
+      selectedRocketKey={selectedRocketKey}
+      savedCustomRockets={savedCustomRockets}
+      onShowSaveManager={() => setShowSaveManager(true)}
+      difficulty={difficulty}
+      onDifficultyChange={(e) => setDifficulty(e.target.value as any)}
+      onShowKeyboardHelp={() => setShowKeyboardHelp(true)}
     >
-      {/* CANVAS — fills the entire window, sits behind all overlays */}
-      <canvas
-        ref={canvasRef}
-        width={canvasWidth}   // Drawing buffer width (actual canvas resolution)
-        height={canvasHeight} // Drawing buffer height
-        onClick={handleCanvasClick} // Click triggers burst thrust
+      <div
         style={{
-          position: "absolute", // Behind all overlays
-          top:      0,
-          left:     0,
-          width:    "100%",   // CSS size = 100% viewport (matches buffer size)
-          height:   "100%",
-          cursor:   "crosshair", // Crosshair cursor indicates click-to-thrust
+          position:   "absolute",
+          inset:      0,
+          overflow:   "hidden",
         }}
-      />
-
-      {/* ── TOP CONTROL BAR ─────────────────────────────────────────────── */}
-      {/* Positioned absolutely over the canvas. Semi-transparent overlay. */}
-      <div style={topBarStyle}>
-
-        {/* Rocket selector — value is selectedRocketKey (not rocketConfig.name) so custom
-            rockets (key="custom:id") display correctly even when the name doesn't match
-            any preset option value. */}
-        <div style={controlGroupStyle}>
-          <span>Rocket:</span>
-          <select value={selectedRocketKey} onChange={handleRocketChange} style={selectStyle}>
-            {/* Built-in presets — keyed by name which matches the preset constant */}
-            <option value="Simple Two-Stage">Simple Two-Stage</option>
-            <option value="Falcon 9 Inspired">Falcon 9 Inspired</option>
-            <option value="Three-Stage Heavy">Three-Stage Heavy</option>
-
-            {/* Active custom config: shown when the user just launched from the builder.
-                Only shown when selectedRocketKey is "custom:active" so it doesn't clutter
-                the list after a custom rocket has been explicitly saved and named. */}
-            {selectedRocketKey === "custom:active" && (
-              <option value="custom:active">
-                ★ {rocketConfig.name} (active)
-              </option>
-            )}
-
-            {/* Saved custom rockets loaded from localStorage at mount time.
-                Each entry has a unique id and a display name set in the builder. */}
-            {savedCustomRockets.map(r => (
-              <option key={r.id} value={`custom:${r.id}`}>
-                ★ {r.name} (custom)
-              </option>
-            ))}
-
-            {/* Sentinel option: selecting this triggers a mode-switch to BUILD mode
-                via handleRocketChange — not an actual loadable rocket */}
-            <option value="Build Custom">⚙ Build Custom...</option>
-          </select>
-
-          {/* Show "Manage" button only when there are saved custom rockets to manage.
-              Opens the save-manager modal where rockets can be deleted. */}
-          {savedCustomRockets.length > 0 && (
-            <button
-              onClick={() => setShowSaveManager(true)} // Open the save manager overlay
-              style={{ ...btnStyle(false), padding: "4px 7px", fontSize: "11px" }}
-              title="View and delete saved custom rockets"
-            >
-              ✎ Manage
-            </button>
-          )}
-        </div>
-
-        {/* Goal selector */}
-        <div style={controlGroupStyle}>
-          <span>Goal:</span>
-          <select
-            value={selectedGoal?.name ?? "custom"}
-            onChange={handleGoalChange}
-            style={selectStyle}
-          >
-            {ALTITUDE_GOALS.map((g) => (
-              <option key={g.name} value={g.name}>{g.name}</option>
-            ))}
-          </select>
-        </div>
-
-        {/* Custom altitude input */}
-        <div style={controlGroupStyle}>
-          <span>Custom (m):</span>
-          <input
-            type="number"
-            value={customGoalAltitude ?? ""}
-            onChange={handleCustomGoal}
-            placeholder="altitude"
-            style={{ ...selectStyle, width: "90px" }}
-          />
-        </div>
-
-        {/* Difficulty selector — controls engine failure probability */}
-        {/* "safe"=no failures, "normal"=30% base, "realistic"=full, "chaos"=10× */}
-        <div style={controlGroupStyle}>
-          <span>Failures:</span>
-          <select
-            value={difficulty} // Controlled by React state
-            onChange={(e) => setDifficulty(e.target.value as DifficultyLevel)} // Update state on change
-            style={selectStyle}
-            title="Engine failure probability: Safe=none, Normal=30%, Realistic=full, Chaos=10×"
-          >
-            <option value="safe">Safe (no failures)</option>
-            <option value="normal">Normal (30%)</option>
-            <option value="realistic">Realistic</option>
-            <option value="chaos">Chaos (10×)</option>
-          </select>
-        </div>
-
-        {/* Reset button */}
-        <button onClick={handleReset} style={btnStyle(false)}>
-          ↺ Reset
-        </button>
-
-        {/* AUTO-FLY toggle button.
-            Active state (autoFlyEnabled = true) shows a highlighted green button
-            with the current autopilot phase (e.g., "AUTO-FLY (Gravity Turn 23°)").
-            Inactive state shows muted blue-gray "AUTO-FLY: OFF".
-            Clicking the button has the same effect as pressing the F key — it toggles
-            the autopilot and syncs both autoFlyEnabledRef and autoFlyStatusRef. */}
-        <button
-          onClick={() => {
-            // Compute the new state (toggle current ref value, not React state,
-            // to stay in sync with the game loop which reads refs).
-            const newEnabled = !autoFlyEnabledRef.current;
-            autoFlyEnabledRef.current = newEnabled; // Update ref (read by game loop)
-
-            if (newEnabled) {
-              // Engaging auto-fly: record current mission time as the T+0 reference.
-              autoFlyStartTimeRef.current = flightStateRef.current.timeElapsed;
-              autoFlyManualOverrideRef.current = false; // Clear any previous manual override
-              autoFlyStatusRef.current = "AUTO-FLY (Throttle Up)"; // Initial HUD label
-            } else {
-              // Disengaging auto-fly: return to manual mode.
-              autoFlyStatusRef.current = "MANUAL"; // HUD shows manual mode
-            }
-
-            setAutoFlyEnabled(newEnabled);       // Re-render this button (ON/OFF label)
-            audioManagerRef.current.playSound("ui-click"); // Audible click feedback
-          }}
-          style={btnStyle(autoFlyEnabled, "#1a8c3a")} // Dark green when active
-          title="Toggle auto-fly autopilot (F key) — rocket flies itself with gravity turn"
-        >
-          {autoFlyEnabled
-            ? `✈ AUTO-FLY: ON`   // Show ON state — autopilot is commanding the rocket
-            : `✈ AUTO-FLY: OFF`  // Show OFF state — player has manual control
-          }
-        </button>
-
-        {/* Vertical separator */}
-        <div style={{ width: "1px", height: "22px", backgroundColor: COLORS.ui, opacity: 0.4 }} />
-
-        {/* ── TIME CONTROLS ──────────────────────────────────────────── */}
-        <div style={controlGroupStyle}>
-          <span>Speed:</span>
-          {/* Pause button */}
-          <button
-            onClick={() => setIsPaused((p) => !p)}
-            style={btnStyle(isPaused, "#cc6600")}
-            title="Pause/Resume (0 key)"
-          >
-            {isPaused ? "▶ RESUME" : "⏸ PAUSE"}
-          </button>
-          {/* 1× speed */}
-          <button
-            onClick={() => { setTimeMultiplier(1);  setIsPaused(false); }}
-            style={btnStyle(!isPaused && timeMultiplier === 1,  "#226633")}
-            title="1× speed (1 key)"
-          >1×</button>
-          {/* 2× speed */}
-          <button
-            onClick={() => { setTimeMultiplier(2);  setIsPaused(false); }}
-            style={btnStyle(!isPaused && timeMultiplier === 2,  "#226633")}
-            title="2× speed (2 key)"
-          >2×</button>
-          {/* 5× speed */}
-          <button
-            onClick={() => { setTimeMultiplier(5);  setIsPaused(false); }}
-            style={btnStyle(!isPaused && timeMultiplier === 5,  "#446611")}
-            title="5× speed (3 key)"
-          >5×</button>
-          {/* 10× speed */}
-          <button
-            onClick={() => { setTimeMultiplier(10); setIsPaused(false); }}
-            style={btnStyle(!isPaused && timeMultiplier === 10, "#663311")}
-            title="10× speed (4 key)"
-          >10×</button>
-        </div>
-
-        {/* Vertical separator */}
-        <div style={{ width: "1px", height: "22px", backgroundColor: COLORS.ui, opacity: 0.4 }} />
-
-        {/* ── AUDIO CONTROLS ─────────────────────────────────────────── */}
-        <div style={controlGroupStyle}>
-          <button
-            onClick={() => {
-              const muted = audioManagerRef.current.toggleMute();
-              setAudioMuted(muted);
-            }}
-            style={btnStyle(audioMuted, "#882222")}
-            title="Toggle mute (M key)"
-          >
-            {audioMuted ? "🔇 MUTED" : "🔊 AUDIO"}
-          </button>
-          <input
-            type="range"
-            min="0" max="1" step="0.05"
-            value={masterVolume}
-            onChange={handleVolumeChange}
-            style={{ width: "70px", cursor: "pointer", accentColor: COLORS.ui }}
-            title="Master volume"
-          />
-          <span style={{ fontSize: "11px" }}>{Math.round(masterVolume * 100)}%</span>
-        </div>
-
-        {/* Key hint — updated to mention auto-fly F key and Max-Q */}
-        <div style={{ marginLeft: "auto", fontSize: "11px", opacity: 0.6 }}>
-          SPACE=thrust · A/D=steer · F=auto-fly · 0-4=speed · P=perf · M=mute · Watch MAX-Q!
-        </div>
-      </div>
-
-      {/* ── TRAJECTORY PANEL — bottom-left overlay ────────────────────────── */}
-      {!showFullscreenTrajectory && (
-        <div
+      >
+        <canvas
+          ref={canvasRef}
+          width={canvasWidth}
+          height={canvasHeight}
+          onClick={handleCanvasClick}
           style={{
             position: "absolute",
-            bottom:   INFO_PANEL_MARGIN,
-            left:     INFO_PANEL_MARGIN,
-            width:    TRAJECTORY_PANEL_WIDTH,
-            height:   TRAJECTORY_PANEL_HEIGHT,
-            zIndex:   10,
+            top:      0,
+            left:     0,
+            width:    "100%",
+            height:   "100%",
+            cursor:   "crosshair",
           }}
-        >
-          <TrajectoryPanel
-            rocketState={displayFlightState}
-            trajectoryHistory={trajectoryHistory}
-            isFullscreen={false}
-            onCloseFullscreen={() => {}}
-          />
-          {/* Expand button in the top-right corner of the trajectory panel */}
-          <button
-            onClick={() => setShowFullscreenTrajectory(true)}
-            style={{
-              position:        "absolute",
-              top:             "4px",
-              right:           "4px",
-              padding:         "2px 6px",
-              fontSize:        "11px",
-              backgroundColor: COLORS.ui,
-              color:           COLORS.text,
-              border:          `1px solid ${COLORS.text}`,
-              cursor:          "pointer",
-              borderRadius:    "2px",
-              zIndex:          11,
-            }}
-            title="Expand trajectory to fullscreen"
-          >⛶</button>
-        </div>
-      )}
-
-      {/* ── FULLSCREEN TRAJECTORY VIEW ──────────────────────────────────────── */}
-      {showFullscreenTrajectory && (
-        <TrajectoryPanel
-          rocketState={displayFlightState as any}
-          trajectoryHistory={trajectoryHistory}
-          isFullscreen={true}
-          onCloseFullscreen={() => setShowFullscreenTrajectory(false)}
         />
-      )}
+
 
       {/* ── LANDING RESULTS MODAL — centered overlay ────────────────────────── */}
       {landingScore !== null && (
@@ -3040,6 +2832,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           </div>
         </div>
       )}
-    </div>
+      </div>
+    </TelemetryDashboard>
   );
 };
