@@ -149,9 +149,9 @@ export const MissionHeader: React.FC<MissionHeaderProps> = ({
           <option value="Simple Two-Stage">Simple Two-Stage</option>
           <option value="Falcon 9 Inspired">Falcon 9 Inspired</option>
           <option value="Three-Stage Heavy">Three-Stage Heavy</option>
-          <option value="Build Custom">⚒ Build Custom</option>
+          <option value="Build Custom">⚒ Create New Custom Rocket...</option>
           {savedCustomRockets.map((r) => (
-            <option key={r.id} value={r.id}>
+            <option key={r.id} value={`custom:${r.id}`}>
               {r.name}
             </option>
           ))}
