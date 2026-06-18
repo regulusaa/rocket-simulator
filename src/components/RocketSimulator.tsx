@@ -898,14 +898,9 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
             } else if (afT < 70 && hasAnyFuel) {
               // PHASE 3: GRAVITY TURN (T+10s to T+70s, 60 seconds)
-              // Gradually tilt the rocket from 0° (vertical) to 45° (diagonal) over 60 seconds.
-              // This "gravity turn" is how real rockets build horizontal orbital velocity —
-              // it converts vertical kinetic energy into horizontal motion efficiently.
-              //
-              // Linear interpolation: progress goes from 0 (at T=10) to 1 (at T=70).
-              // Target angle goes from 0 rad (vertical) to π/4 rad (45° right of vertical).
-              const turnProgress = (afT - 10) / 60; // 0.0 to 1.0 over the 60-second turn
-              autoFlyTargetAngle = turnProgress * (Math.PI / 4); // 0 → π/4 radians (0° → 45°)
+              // Uses the new dynamic gravity turn from the physics engine (state.autoPitchTarget).
+              // The engine calculates this based on velocity vector / altitude to be physically accurate.
+              autoFlyTargetAngle = state.autoPitchTarget;
               spacebar = true;  // Full throttle throughout the gravity turn
               tiltLeft = false; // Angle is controlled by the proportional controller below,
               tiltRight = false; // NOT by tiltLeft/tiltRight (which add incremental angular velocity)
