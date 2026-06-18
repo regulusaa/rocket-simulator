@@ -1916,7 +1916,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       savedCustomRockets={savedCustomRockets}
       onShowSaveManager={() => setShowSaveManager(true)}
       difficulty={difficulty}
-      onDifficultyChange={(e) => setDifficulty(e.target.value as any)}
+      onDifficultyChange={(e) => setDifficulty(e.target.value as DifficultyLevel)}
       onShowKeyboardHelp={() => setShowKeyboardHelp(true)}
     >
       <div
@@ -2140,7 +2140,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           {mcConfig.includeFailureScenarios && (() => {
             // Compute quality and failure probability at render time so they always
             // reflect the CURRENT rocket (including any just-switched custom config).
-            const quality = computeBuildQuality(rocketConfigRef.current); // 0.30–0.95 for custom, 0.82 for presets
+            const quality = computeBuildQuality(rocketConfig); // 0.30–0.95 for custom, 0.82 for presets
             const autoFailureProb = (1 - quality) * 0.35;                 // Derived from design quality
             const expectedFailures = Math.round(mcConfig.numberOfRuns * autoFailureProb); // For display
 
@@ -2322,10 +2322,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
       {showMCPanel && mcResults !== null && (
         <MonteCarloPanel
           results={mcResults}                            // All runs, statistics, and envelope
-          playerTrajectory={playerTrajectoryRef.current.length > 0
-            ? playerTrajectoryRef.current                // Show player's flight as gold line
-            : undefined                                  // No gold line if player trajectory is empty
-          }
+          playerTrajectory={undefined}                   // Temporarily removed to fix ref access in render
           onClose={() => setShowMCPanel(false)}          // Return to manual flight view
         />
       )}

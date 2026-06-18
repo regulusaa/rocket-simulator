@@ -235,7 +235,7 @@ export function createDefaultMonteCarloConfig(): MonteCarloConfig {
  * @param dispersions  The ±% ranges for each parameter
  * @returns            A new config with random dispersions applied, plus the values used
  */
-function applyDispersions(
+export function applyDispersions(
   baseConfig: MultiStageRocketConfig,
   dispersions: MonteCarloConfig['dispersions']
 ): { config: MultiStageRocketConfig; applied: DispersionValues } {
@@ -381,7 +381,7 @@ const STRUCTURAL_FAILURE_Q_LIMIT = 10000; // 10 kPa — significantly below norm
  * @param mcConfig     Monte Carlo configuration (dispersions, failures)
  * @returns            Complete SimulationRun with trajectory and statistics
  */
-function simulateOneRun(
+export function simulateOneRun(
   id: number,
   baseConfig: MultiStageRocketConfig,
   mcConfig: MonteCarloConfig
@@ -628,8 +628,8 @@ function simulateOneRun(
       if (dynamicPressure > STRUCTURAL_FAILURE_Q_LIMIT) {
         // Airframe buckles — flight ends here
         structurallyFailed = true;
-        failureDescription = `Structural failure at T+${t.toFixed(0)}s — Max-Q exceeded (q=${(dynamicPressure / 1000).toFixed(1)} kPa)`;
         outcome = 'structural_failure';
+        failureDescription = `Structural failure at T+${t.toFixed(0)}s — Max-Q exceeded (q=${(dynamicPressure / 1000).toFixed(1)} kPa)`;
         // Record the failure point as the last trajectory point before breaking
         trajectoryHistory.push({ x: state.position.x, y: Math.max(0, state.position.y), t });
         break; // Terminate the simulation — rocket no longer exists
@@ -831,7 +831,7 @@ function interpolateAtTime(
  *
  * @param runs  All completed simulation runs with trajectory data
  */
-function computeTrajectoryEnvelope(
+export function computeTrajectoryEnvelope(
   runs: SimulationRun[]
 ): MonteCarloResults['trajectoryEnvelope'] {
   const NUM_POINTS = 100; // Number of time steps at which to evaluate the envelope
@@ -888,7 +888,7 @@ function computeTrajectoryEnvelope(
  *
  * @param runs  All completed simulation runs
  */
-function computeMonteCarloResults(runs: SimulationRun[]): MonteCarloResults {
+export function computeMonteCarloResults(runs: SimulationRun[]): MonteCarloResults {
   // Extract arrays of key metrics for statistical computations
   const altitudes     = runs.map(r => r.maxAltitude);     // All peak altitudes (meters)
   const landingVels   = runs.map(r => r.landingVelocity); // All landing speeds (m/s)
@@ -990,47 +990,29 @@ export function runMonteCarloSimulation(
   onProgress: (completed: number, total: number) => void,
   onComplete: (results: MonteCarloResults) => void
 ): { cancel: () => void } {
-  // Cancellation flag: when set to true, the async loop will stop after the current run
-  let cancelled = false;
+  // Spawn the Web Worker
+  const worker = new Worker(new URL('./monteCarloWorker.ts', import.meta.url), { type: 'module' });
 
-  // Expose a cancel function so the UI can abort mid-simulation
-  const cancel = () => { cancelled = true; };
-
-  // Helper: yields to the browser event loop once.
-  // This is the key to non-blocking execution — each `await yieldToEventLoop()`
-  // gives the browser time to render a frame and handle user interactions.
-  const yieldToEventLoop = (): Promise<void> =>
-    new Promise(resolve => setTimeout(resolve, 0));
-
-  // Async IIFE (Immediately Invoked Function Expression) to run all simulations
-  // in sequence, yielding between each one for UI responsiveness.
-  (async () => {
-    const allRuns: SimulationRun[] = []; // Accumulates completed runs
-
-    // Run each simulation in sequence (not truly parallel, but interleaved with UI)
-    for (let i = 0; i < mcConfig.numberOfRuns; i++) {
-      if (cancelled) return; // Check cancellation before each run
-
-      // Yield to browser: allows React to re-render the progress bar
-      // and the user to still click buttons while simulation runs
-      await yieldToEventLoop();
-
-      if (cancelled) return; // Check again after yield (user might cancel during yield)
-
-      // Run one complete automated flight simulation (synchronous, ~15ms)
-      const run = simulateOneRun(i, baseConfig, mcConfig);
-      allRuns.push(run); // Add to accumulator
-
-      // Notify the UI of progress (updates the progress bar)
-      onProgress(i + 1, mcConfig.numberOfRuns);
+  worker.onmessage = (e: MessageEvent<any>) => {
+    if (e.data.type === 'progress') {
+      onProgress(e.data.completed as number, e.data.total as number);
+    } else if (e.data.type === 'complete') {
+      onComplete(e.data.results as MonteCarloResults);
+      worker.terminate();
     }
+  };
 
-    if (cancelled) return; // Final check: don't compute results if cancelled
+  // Start the simulation batch
+  worker.postMessage({
+    type: 'start',
+    baseConfig,
+    mcConfig
+  });
 
-    // All runs complete — compute statistics and envelope, then notify the UI
-    const results = computeMonteCarloResults(allRuns);
-    onComplete(results); // Triggers the UI to show the MonteCarloPanel
-  })();
-
-  return { cancel }; // Return cancel handle so caller can abort if needed
+  return {
+    cancel: () => {
+      // If cancelled, terminate the worker thread immediately
+      worker.terminate();
+    }
+  };
 }
