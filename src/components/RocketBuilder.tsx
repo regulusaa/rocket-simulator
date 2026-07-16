@@ -991,6 +991,19 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
       });
     });
 
+    // ── PART MANIFEST (visual-only) ──────────────────────────────────────
+    // Record WHICH catalog parts built each stage so the 3D flight view can
+    // render the actual assembled rocket (same ID extraction as SavedBuild).
+    const stageParts = stages.map((buildStage) => ({
+      engineIds: buildStage.engines.map((e) => e.id),
+      tankIds: buildStage.fuelTanks.map((t) => t.id),
+      rcsThrusterIds: buildStage.rcsThrusters.map((r) => r.id),
+      finId: buildStage.fins?.id ?? null,
+      landingLegId: buildStage.landingLegs?.id ?? null,
+      interstageAdapterId: buildStage.interstageAdapter?.id ?? null,
+      noseConeId: buildStage.noseCone?.id ?? null,
+    }));
+
     // ── RETURN COMPLETE CONFIG ────────────────────────────────────────────
     // Embed the quality score so the Monte Carlo simulator can auto-set failure probability
     // without needing a manual slider. The simulator reads buildQualityScore from this object.
@@ -999,6 +1012,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
       stages: configStages,                        // All stages, bottom-to-top
       payloadMass: PAYLOAD_MASS_KG,                // 500 kg generic payload (satellite)
       buildQualityScore: qualityScore,             // 0.3–0.95: drives MC failure probability
+      stageParts,                                  // Catalog part IDs per stage (3D visuals)
     };
   }, [stages, computeStats]); // Recompute when stages or stats computation changes
 

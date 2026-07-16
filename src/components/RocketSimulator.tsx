@@ -42,9 +42,12 @@ import { ParticleSystem } from "../physics/ParticleSystem";
 
 import { Canvas } from '@react-three/fiber';
 import { SceneSetup } from './3d/SceneSetup';
-import { RocketMesh } from './3d/RocketMesh';
+import { RocketAssembly } from './3d/rocket/RocketAssembly';
 import { ExhaustParticles } from './3d/ExhaustParticles';
 import { CameraRig } from './3d/CameraRig';
+import { PostFX } from './3d/effects/PostFX';
+import { LaunchSmoke } from './3d/effects/LaunchSmoke';
+import { DEFAULT_VISUAL_INFO, type RocketVisualInfo } from './3d/rocket/types';
 
 import {
   createParachute,
@@ -350,6 +353,11 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
 
   // Camera: tracks the rocket with lerp smoothing + logarithmic zoom.
   const cameraRef = useRef<Camera>(new Camera());
+
+  // Per-frame visual info published by RocketAssembly (stack height/center,
+  // active nozzle position, plume style) and read by CameraRig,
+  // ExhaustParticles, and LaunchSmoke — the 3D scene's shared render bridge.
+  const rocketVisualInfoRef = useRef<RocketVisualInfo>({ ...DEFAULT_VISUAL_INFO });
 
   // Keys currently held down (set by keydown/keyup event listeners).
   // Using an object (hash map) allows O(1) key-state lookup each frame.
@@ -1937,15 +1945,33 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             height:   "100%",
             cursor:   "crosshair",
           }}
-          camera={{ position: [0, 0, 100], fov: 45 }}
+          shadows
+          dpr={[1, 2]}
+          camera={{ position: [0, 4, 60], fov: 40, near: 0.1, far: 20000 }}
         >
           <SceneSetup flightStateRef={flightStateRef} />
-          <CameraRig flightStateRef={flightStateRef} />
-          <RocketMesh flightStateRef={flightStateRef} />
-          <ExhaustParticles 
-            flightStateRef={flightStateRef} 
-            configRef={rocketConfigRef} 
+          <CameraRig flightStateRef={flightStateRef} visualInfoRef={rocketVisualInfoRef} />
+          {/* Procedural rocket built from the actual assembled parts.
+              `config={rocketConfig}` (React state) gets a fresh identity on
+              every rocket switch/reset — that's the geometry rebuild trigger. */}
+          <RocketAssembly
+            flightStateRef={flightStateRef}
+            config={rocketConfig}
+            configRef={rocketConfigRef}
+            visualInfoRef={rocketVisualInfoRef}
           />
+          <ExhaustParticles
+            flightStateRef={flightStateRef}
+            configRef={rocketConfigRef}
+            visualInfoRef={rocketVisualInfoRef}
+          />
+          <LaunchSmoke
+            flightStateRef={flightStateRef}
+            configRef={rocketConfigRef}
+            visualInfoRef={rocketVisualInfoRef}
+          />
+          {/* Bloom/vignette — remove this single line if perf ever suffers. */}
+          <PostFX />
         </Canvas>
 
 

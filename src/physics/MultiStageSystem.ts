@@ -62,6 +62,23 @@ export interface RocketStage {
 }
 
 /**
+ * Catalog part IDs used to build one stage, index-aligned with `stages[]`.
+ * VISUAL-ONLY metadata: the 3D flight view uses these IDs to render the actual
+ * parts the player assembled (engine bells, tank colors, fins, legs, …).
+ * Physics functions in this file never read it. Mirrors the per-stage shape of
+ * RocketBuilder's SavedBuild so serialization stays consistent.
+ */
+export interface StagePartIds {
+  engineIds: string[];                // Catalog IDs of all engines on this stage
+  tankIds: string[];                  // Catalog IDs of all fuel tanks on this stage
+  rcsThrusterIds: string[];           // Catalog IDs of RCS thrusters on this stage
+  finId: string | null;               // Fin set ID (bottom stage only), or null
+  landingLegId: string | null;        // Landing leg set ID (bottom stage only), or null
+  interstageAdapterId: string | null; // Adapter connecting to the stage above, or null
+  noseConeId: string | null;          // Nose cone ID (topmost stage only), or null
+}
+
+/**
  * A complete multi-stage rocket definition.
  * Passed to the physics engine to calculate mass, thrust, and staging.
  */
@@ -69,6 +86,11 @@ export interface MultiStageRocketConfig {
   name: string;         // Display name (e.g., "Falcon 9 Inspired")
   stages: RocketStage[]; // All stages bottom-to-top (stages[0] fires first)
   payloadMass: number;  // kg — non-propellant mass at the top (satellite, capsule)
+
+  // Optional per-stage part manifest (index-aligned with stages[]).
+  // Set by RocketBuilder for custom builds; presets and old saved configs omit it
+  // and the 3D view falls back to preset manifests / inference. Visual-only.
+  stageParts?: StagePartIds[];
 
   // Optional build quality score (0.0 – 1.0) set by RocketBuilder when the config is created.
   // This encodes how well-engineered the rocket is based on part compatibility, TWR margin,
