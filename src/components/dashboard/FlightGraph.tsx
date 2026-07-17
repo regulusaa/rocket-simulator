@@ -47,7 +47,7 @@ const ChartTooltip: React.FC<{
     <div
       style={{
         background: 'rgba(8, 14, 32, 0.92)',
-        border: '1px solid rgba(50, 90, 160, 0.3)',
+        border: '1px solid rgba(255, 255, 255, 0.09)',
         borderRadius: '4px',
         padding: '6px 10px',
         fontFamily: 'var(--font-mono)',
@@ -125,7 +125,7 @@ export const FlightGraph: React.FC = () => {
           >
             <CartesianGrid
               strokeDasharray="3 3"
-              stroke="rgba(50,90,160,0.15)"
+              stroke="rgba(255,255,255,0.06)"
               vertical={false}
             />
 
@@ -135,8 +135,8 @@ export const FlightGraph: React.FC = () => {
               type="number"
               domain={['dataMin', 'dataMax']}
               tickFormatter={(v: number) => `${v.toFixed(0)}s`}
-              tick={{ fontSize: 9, fill: '#556688' }}
-              stroke="rgba(50,90,160,0.2)"
+              tick={{ fontSize: 9, fill: '#8a8d94' }}
+              stroke="rgba(255,255,255,0.09)"
               tickLine={false}
               axisLine={false}
             />
@@ -145,8 +145,8 @@ export const FlightGraph: React.FC = () => {
             <YAxis
               yAxisId="velocity"
               orientation="left"
-              tick={{ fontSize: 9, fill: '#556688' }}
-              stroke="rgba(50,90,160,0.2)"
+              tick={{ fontSize: 9, fill: '#8a8d94' }}
+              stroke="rgba(255,255,255,0.09)"
               tickLine={false}
               axisLine={false}
               tickFormatter={(v: number) => `${v.toFixed(0)}`}
@@ -163,8 +163,8 @@ export const FlightGraph: React.FC = () => {
             <YAxis
               yAxisId="q"
               orientation="right"
-              tick={{ fontSize: 9, fill: '#556688' }}
-              stroke="rgba(50,90,160,0.2)"
+              tick={{ fontSize: 9, fill: '#8a8d94' }}
+              stroke="rgba(255,255,255,0.09)"
               tickLine={false}
               axisLine={false}
               tickFormatter={(v: number) => `${v.toFixed(1)}`}

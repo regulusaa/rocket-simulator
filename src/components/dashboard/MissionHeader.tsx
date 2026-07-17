@@ -257,7 +257,7 @@ export const MissionHeader: React.FC<MissionHeaderProps> = ({
             step="0.1" 
             value={mission.cameraZoom} 
             onChange={(e) => useTelemetryStore.getState().updateMission({ cameraZoom: parseFloat(e.target.value) })}
-            style={{ width: '60px', accentColor: '#4a6fa5' }}
+            style={{ width: '60px', accentColor: '#38bdf8' }}
             title="Camera Zoom"
           />
         </div>

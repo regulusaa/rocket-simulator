@@ -11,23 +11,23 @@
 :root {
   /* ── COLOR PALETTE ─────────────────────────────────────────── */
 
-  /* Background layers — deep space gradient */
-  --bg-void:         #040810;           /* Deepest black — behind canvas */
-  --bg-primary:      #080c1a;           /* Main background */
-  --bg-panel:        rgba(8, 14, 32, 0.82);   /* Panel surface */
-  --bg-panel-hover:  rgba(14, 22, 48, 0.88);  /* Hovered panel */
-  --bg-panel-active: rgba(18, 28, 58, 0.92);  /* Active/selected */
-  --bg-input:        rgba(6, 10, 24, 0.95);   /* Input/select fields */
+  /* Background layers — neutral graphite (NASA OpenMCT-style charcoal, no blue tint) */
+  --bg-void:         #0a0b0d;           /* Deepest black — behind canvas */
+  --bg-primary:      #0f1012;           /* Main background */
+  --bg-panel:        rgba(23, 24, 28, 0.82);   /* Panel surface */
+  --bg-panel-hover:  rgba(32, 34, 39, 0.90);   /* Hovered panel */
+  --bg-panel-active: rgba(38, 40, 46, 0.92);   /* Active/selected */
+  --bg-input:        rgba(15, 16, 18, 0.95);   /* Input/select fields */
 
-  /* Glass effects */
-  --glass-border:    rgba(50, 90, 160, 0.22);
-  --glass-border-hi: rgba(60, 120, 200, 0.35);
-  --glass-glow:      rgba(0, 140, 255, 0.06);
+  /* Glass effects — neutral grey edges instead of blue */
+  --glass-border:    rgba(255, 255, 255, 0.09);
+  --glass-border-hi: rgba(255, 255, 255, 0.16);
+  --glass-glow:      rgba(255, 255, 255, 0.04);
   --glass-blur:      12px;
 
   /* Accent colors — functional semantics */
-  --accent-cyan:     #00d4ff;       /* Primary accent — data labels, links */
-  --accent-blue:     #3388ff;       /* Secondary accent — interactive elements */
+  --accent-cyan:     #38bdf8;       /* Primary accent (ice cyan) — data labels, links */
+  --accent-blue:     #38bdf8;       /* Secondary accent — interactive elements (unified to ice cyan) */
   --accent-green:    #00ff88;       /* Success — GO, nominal, landed */
   --accent-orange:   #ff8c00;       /* Caution — warnings, transonic */
   --accent-red:      #ff3040;       /* Danger — failures, critical */
@@ -35,15 +35,15 @@
   --accent-purple:   #aa66ff;       /* Info — special events */
 
   /* Dim versions for backgrounds/fills */
-  --accent-cyan-dim:   rgba(0, 212, 255, 0.12);
+  --accent-cyan-dim:   rgba(56, 189, 248, 0.14);
   --accent-green-dim:  rgba(0, 255, 136, 0.10);
   --accent-orange-dim: rgba(255, 140, 0, 0.10);
   --accent-red-dim:    rgba(255, 48, 64, 0.10);
 
-  /* Text hierarchy */
-  --text-primary:    #e8eef8;       /* Main readable text */
-  --text-secondary:  #8899bb;       /* Labels, descriptions */
-  --text-tertiary:   #556688;       /* Hints, disabled */
+  /* Text hierarchy — neutral greys */
+  --text-primary:    #e7e8ea;       /* Main readable text */
+  --text-secondary:  #9a9ca3;       /* Labels, descriptions */
+  --text-tertiary:   #6b6e76;       /* Hints, disabled */
   --text-value:      #ffffff;       /* Data values (bright) */
 
   /* ── TYPOGRAPHY ────────────────────────────────────────────── */
@@ -73,8 +73,8 @@
   --radius-lg:  10px;
 
   /* ── SHADOWS ───────────────────────────────────────────────── */
-  --shadow-panel:    0 2px 20px rgba(0, 0, 0, 0.4), 0 0 1px rgba(50, 90, 160, 0.15);
-  --shadow-glow:     0 0 15px rgba(0, 180, 255, 0.08);
+  --shadow-panel:    0 2px 20px rgba(0, 0, 0, 0.45), 0 0 1px rgba(255, 255, 255, 0.05);
+  --shadow-glow:     0 0 15px rgba(56, 189, 248, 0.08);
   --shadow-inner:    inset 0 1px 3px rgba(0, 0, 0, 0.3);
 
   /* ── TRANSITIONS ───────────────────────────────────────────── */

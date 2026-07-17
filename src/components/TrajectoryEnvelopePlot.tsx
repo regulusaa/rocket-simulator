@@ -84,9 +84,9 @@ const FAILURE_SELECTED    = 'rgba(255, 80, 80, 0.85)';   // Bright red: selected
 const MEAN_COLOR          = 'rgba(255, 255, 255, 0.9)';  // White: mean trajectory (thick)
 const ENVELOPE_COLOR      = 'rgba(0, 220, 255, 0.8)';    // Cyan: 95% confidence envelope bounds
 const PLAYER_COLOR        = 'rgba(255, 200, 50, 0.95)';  // Gold: player's manual flight
-const GRID_COLOR          = 'rgba(100, 120, 160, 0.2)';  // Faint blue-gray: reference grid
-const AXIS_COLOR          = 'rgba(180, 200, 240, 0.7)';  // Light blue: axis labels and tick marks
-const BACKGROUND          = 'rgba(4, 6, 20, 1)';         // Near-black space background
+const GRID_COLOR          = 'rgba(255, 255, 255, 0.08)'; // Faint neutral grey: reference grid
+const AXIS_COLOR          = 'rgba(210, 213, 218, 0.7)';  // Neutral light grey: axis labels/ticks
+const BACKGROUND          = 'rgba(15, 16, 18, 1)';       // Graphite (matches panel theme)
 
 // ─── COMPONENT ─────────────────────────────────────────────────────────────────
 
@@ -257,8 +257,13 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const cw = canvas.width;  // Current canvas width in pixels
-    const ch = canvas.height; // Current canvas height in pixels
+    // HiDPI: the buffer is sized to CSS px × devicePixelRatio (see the sizing effects),
+    // so map the context to logical CSS pixels and do ALL drawing math in CSS units.
+    // This keeps lines and text crisp on retina without changing any layout constants.
+    const dpr = canvas.width / (canvas.clientWidth || canvas.width);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const cw = canvas.clientWidth || canvas.width;  // Logical (CSS) width in pixels
+    const ch = canvas.clientHeight || canvas.height; // Logical (CSS) height in pixels
 
     // ── BACKGROUND ──────────────────────────────────────────────────────
     ctx.fillStyle = BACKGROUND;
@@ -457,7 +462,7 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
       // Tooltip background box — use the cross-browser rounded-rect helper.
       // ctx.roundRect() is only available in Chrome 99+/Firefox 112+/Safari 15.4+;
       // the helper falls back to arcTo() on older browsers.
-      ctx.fillStyle = 'rgba(5, 10, 30, 0.92)'; // Near-opaque dark background
+      ctx.fillStyle = 'rgba(20, 21, 25, 0.94)'; // Near-opaque graphite background
       ctx.strokeStyle = 'rgba(0, 200, 80, 0.8)'; // Green border for nominal
       ctx.lineWidth = 1;
       roundRectPathLocal(ctx, tx, ty, tw, th, 4); // Fill path
@@ -493,7 +498,7 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
     const legendY = 12;        // Top of legend
 
     // Legend background box
-    ctx.fillStyle = 'rgba(4, 6, 20, 0.85)'; // Match background
+    ctx.fillStyle = 'rgba(15, 16, 18, 0.85)'; // Match graphite background
     ctx.fillRect(legendX - 8, legendY - 6, 178, playerTrajectory ? 110 : 95);
 
     // Legend entries: colored line sample + label text
@@ -543,12 +548,14 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
     const container = containerRef.current;
     if (!canvas || !container || runs.length === 0) return;
 
-    // Set canvas dimensions to match the container (CSS fill)
-    canvas.width  = container.clientWidth;  // Canvas buffer width = container pixel width
-    canvas.height = container.clientHeight; // Canvas buffer height = container pixel height
+    // Set the buffer to the container size × devicePixelRatio for crisp HiDPI rendering.
+    // CSS keeps the element at container size; drawCanvas maps the context back to CSS px.
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width  = Math.round(container.clientWidth  * dpr); // Buffer width in device pixels
+    canvas.height = Math.round(container.clientHeight * dpr); // Buffer height in device pixels
 
-    // Compute the auto-fit transform (scale and pan to show all trajectories)
-    computeAutoFit(canvas.width, canvas.height);
+    // Compute the auto-fit transform in LOGICAL (CSS) pixels — all layout math is CSS-space.
+    computeAutoFit(container.clientWidth, container.clientHeight);
     // Draw the canvas with the new transform
     drawCanvas();
   }, [runs, computeAutoFit, drawCanvas]); // Re-run whenever runs data changes
@@ -569,9 +576,10 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
     const observer = new ResizeObserver(() => {
       const canvas = canvasRef.current;
       if (!canvas) return;
-      canvas.width  = container.clientWidth;  // Update canvas buffer width
-      canvas.height = container.clientHeight; // Update canvas buffer height
-      computeAutoFit(canvas.width, canvas.height); // Recompute transform for new size
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width  = Math.round(container.clientWidth  * dpr); // Buffer width (device px)
+      canvas.height = Math.round(container.clientHeight * dpr); // Buffer height (device px)
+      computeAutoFit(container.clientWidth, container.clientHeight); // Fit in logical (CSS) px
       drawCanvas(); // Redraw at new size
     });
 
@@ -586,7 +594,7 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const ch = canvas.height;
+    const ch = canvas.clientHeight; // Logical (CSS) height — matches drawCanvas's CSS-space math
 
     // Mouse position in screen pixels (relative to canvas top-left)
     const mouseScreenX = e.clientX - canvas.getBoundingClientRect().left;
@@ -629,7 +637,7 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const ch = canvas.height;
+    const ch = canvas.clientHeight; // Logical (CSS) height — matches drawCanvas's CSS-space math
 
     // ── PANNING ────────────────────────────────────────────────────
     if (isDraggingRef.current) {
@@ -741,7 +749,7 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
   const handleResetView = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    computeAutoFit(canvas.width, canvas.height); // Recompute auto-fit transform
+    computeAutoFit(canvas.clientWidth, canvas.clientHeight); // Recompute auto-fit in logical px
     drawCanvas(); // Redraw at auto-fit view
   }, [computeAutoFit, drawCanvas]);
 
@@ -780,9 +788,10 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
         onMouseLeave={handleMouseLeave} // Cancel interaction if mouse exits canvas
         style={{
           display: 'block',   // Remove default inline gap below canvas
-          width: '100%',      // CSS size = 100% of container (matches buffer size)
+          width: '100%',      // CSS size = 100% of container (buffer is CSS px × dpr)
           height: '100%',
           cursor: 'grab',     // Default cursor: open hand (indicates draggable)
+          imageRendering: 'auto', // Override the global pixel-art hint — keep chart lines smooth
         }}
       />
 
@@ -803,9 +812,9 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
             padding: '3px 8px',
             fontSize: '11px',
             fontFamily: 'monospace',
-            backgroundColor: 'rgba(10, 20, 50, 0.85)',
-            color: 'rgba(180, 210, 255, 0.9)',
-            border: '1px solid rgba(80, 120, 200, 0.5)',
+            backgroundColor: 'rgba(28, 30, 35, 0.85)',
+            color: 'rgba(220, 222, 226, 0.9)',
+            border: '1px solid rgba(255, 255, 255, 0.16)',
             borderRadius: 3,
             cursor: 'pointer',
           }}
@@ -821,9 +830,9 @@ export const TrajectoryEnvelopePlot: React.FC<TrajectoryEnvelopePlotProps> = ({
             padding: '3px 8px',
             fontSize: '11px',
             fontFamily: 'monospace',
-            backgroundColor: 'rgba(10, 20, 50, 0.85)',
-            color: 'rgba(180, 210, 255, 0.9)',
-            border: '1px solid rgba(80, 120, 200, 0.5)',
+            backgroundColor: 'rgba(28, 30, 35, 0.85)',
+            color: 'rgba(220, 222, 226, 0.9)',
+            border: '1px solid rgba(255, 255, 255, 0.16)',
             borderRadius: 3,
             cursor: 'pointer',
           }}

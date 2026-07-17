@@ -1353,7 +1353,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
     flexDirection: "row",
     height: "100vh",           // Full viewport height
     width: "100vw",            // Full viewport width
-    backgroundColor: "#03050f", // Very dark background matching the space simulator theme
+    backgroundColor: "#0d0e11", // Very dark background matching the space simulator theme
     color: COLORS.text,        // Light text on dark background
     fontFamily: "monospace",   // Consistent monospace font across the simulator
     overflow: "hidden",        // Prevent any scroll bars on the root container
@@ -1365,13 +1365,13 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
     flexDirection: "column",
     height: "100%",
     overflow: "hidden",         // Each panel scrolls independently
-    borderRight: "1px solid rgba(74,111,165,0.3)", // Subtle column dividers
+    borderRight: "1px solid rgba(255,255,255,0.12)", // Subtle column dividers
   };
 
   // Header bar shared across all three panels
   const panelHeader: React.CSSProperties = {
-    backgroundColor: "rgba(5, 8, 25, 0.95)", // Dark header band
-    borderBottom: "1px solid rgba(74,111,165,0.5)", // Accent-colored border
+    backgroundColor: "rgba(18, 19, 23, 0.96)", // Dark header band
+    borderBottom: "1px solid rgba(255,255,255,0.16)", // Accent-colored border
     padding: "10px 12px",
     flexShrink: 0,              // Header never shrinks; only the content area scrolls
     fontSize: "13px",
@@ -1382,9 +1382,9 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
   // Tab button style factory: returns highlighted style when this tab is active
   const tabBtn = (isActive: boolean): React.CSSProperties => ({
     padding: "4px 8px",
-    backgroundColor: isActive ? COLORS.ui : "rgba(15, 25, 50, 0.9)", // Highlight active tab
+    backgroundColor: isActive ? COLORS.ui : "rgba(28, 30, 35, 0.9)", // Highlight active tab
     color: isActive ? "#fff" : COLORS.text,
-    border: `1px solid ${isActive ? COLORS.ui : "rgba(74,111,165,0.3)"}`,
+    border: `1px solid ${isActive ? COLORS.ui : "rgba(255,255,255,0.12)"}`,
     borderRadius: "3px",
     cursor: "pointer",
     fontSize: "11px",
@@ -1471,8 +1471,8 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
         style={{
           padding: "8px 10px",
           marginBottom: "4px",
-          backgroundColor: isDisabled ? "rgba(10,12,25,0.5)" : "rgba(15,25,55,0.8)", // Grey if disabled
-          border: `1px solid ${isDisabled ? "rgba(74,111,165,0.2)" : "rgba(74,111,165,0.5)"}`,
+          backgroundColor: isDisabled ? "rgba(15,16,18,0.5)" : "rgba(23,24,28,0.8)", // Grey if disabled
+          border: `1px solid ${isDisabled ? "rgba(255,255,255,0.09)" : "rgba(255,255,255,0.16)"}`,
           borderRadius: "4px",
           opacity: isDisabled ? 0.5 : 1,       // Dim disabled tiles
           transition: "background-color 0.15s", // Smooth hover transition
@@ -1481,10 +1481,10 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
           alignItems: "flex-start",              // Align hologram to the top of the tile
         }}
         onMouseEnter={(e) => { // Highlight on hover when enabled
-          if (!isDisabled) (e.currentTarget as HTMLDivElement).style.backgroundColor = "rgba(20,40,90,0.9)";
+          if (!isDisabled) (e.currentTarget as HTMLDivElement).style.backgroundColor = "rgba(30,33,40,0.9)";
         }}
         onMouseLeave={(e) => { // Restore when mouse leaves
-          if (!isDisabled) (e.currentTarget as HTMLDivElement).style.backgroundColor = "rgba(15,25,55,0.8)";
+          if (!isDisabled) (e.currentTarget as HTMLDivElement).style.backgroundColor = "rgba(23,24,28,0.8)";
         }}
       >
         {/* ── HOLOGRAM THUMBNAIL ─────────────────────────────────────────────
@@ -1517,7 +1517,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
             {part.name}
           </div>
           {/* Key specifications line */}
-          <div style={{ fontSize: "10px", color: "#8899bb", marginBottom: "2px" }}>
+          <div style={{ fontSize: "10px", color: "#9a9ca3", marginBottom: "2px" }}>
             {keySpec}
           </div>
           {/* Assembly time badge */}
@@ -1551,9 +1551,9 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
             onClick={onSwitchToFlyMode} // Go back to the flight simulator view
             style={{
               padding: "3px 8px",
-              backgroundColor: "rgba(15,25,50,0.9)",
+              backgroundColor: "rgba(28,30,35,0.9)",
               color: COLORS.text,
-              border: `1px solid rgba(74,111,165,0.5)`,
+              border: `1px solid rgba(255,255,255,0.16)`,
               borderRadius: "3px",
               cursor: "pointer",
               fontSize: "11px",
@@ -1565,8 +1565,8 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
         </div>
 
         {/* Target stage selector: tells the catalog which stage to add parts to */}
-        <div style={{ padding: "8px 12px", backgroundColor: "rgba(5,8,20,0.8)", borderBottom: "1px solid rgba(74,111,165,0.2)", flexShrink: 0 }}>
-          <span style={{ fontSize: "11px", color: "#8899bb" }}>Adding to: </span>
+        <div style={{ padding: "8px 12px", backgroundColor: "rgba(15,16,18,0.85)", borderBottom: "1px solid rgba(255,255,255,0.09)", flexShrink: 0 }}>
+          <span style={{ fontSize: "11px", color: "#9a9ca3" }}>Adding to: </span>
           {stages.map((s) => (
             <button
               key={s.stageIndex}
@@ -1587,7 +1587,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
         </div>
 
         {/* Category tabs: Engines, Tanks, Nose, RCS, Fins, Interstage, Legs */}
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "3px", padding: "6px 8px", flexShrink: 0, borderBottom: "1px solid rgba(74,111,165,0.2)" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "3px", padding: "6px 8px", flexShrink: 0, borderBottom: "1px solid rgba(255,255,255,0.09)" }}>
           {(Object.keys(TAB_LABELS) as CatalogTab[]).map((tab) => (
             <button
               key={tab}
@@ -1609,7 +1609,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
           <div style={{
             flexShrink: 0,
             padding: "10px 12px",
-            backgroundColor: "rgba(5, 8, 25, 0.95)",
+            backgroundColor: "rgba(18, 19, 23, 0.96)",
             borderTop: `1px solid ${COLORS.ui}`,
           }}>
             {/* Assembly title */}
@@ -1617,16 +1617,16 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
               Installing: {assembly.part.name}
             </div>
             {/* Rotating status message */}
-            <div style={{ fontSize: "11px", color: "#8899bb", marginBottom: "6px", minHeight: "14px" }}>
+            <div style={{ fontSize: "11px", color: "#9a9ca3", marginBottom: "6px", minHeight: "14px" }}>
               {assemblyMessage}
             </div>
             {/* Progress bar container */}
             <div style={{
               height: "10px",
-              backgroundColor: "rgba(20,30,60,0.8)",
+              backgroundColor: "rgba(26,28,33,0.8)",
               borderRadius: "5px",
               overflow: "hidden",
-              border: "1px solid rgba(74,111,165,0.3)",
+              border: "1px solid rgba(255,255,255,0.12)",
               marginBottom: "6px",
             }}>
               {/* Progress fill: width driven by assemblyProgress (0–1) */}
@@ -1668,7 +1668,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
            Now rendered by RocketAssemblyPreview: a canvas-based component
            that draws the rocket as a proportionally accurate 2D side-view.
           ═══════════════════════════════════════════════════════════════ */}
-      <div style={{ ...panelBase, width: "30%", borderRight: "1px solid rgba(74,111,165,0.3)" }}>
+      <div style={{ ...panelBase, width: "30%", borderRight: "1px solid rgba(255,255,255,0.12)" }}>
 
         <div style={panelHeader}>
           ROCKET ASSEMBLY — {stages.length} STAGE{stages.length > 1 ? "S" : ""}
@@ -1698,28 +1698,28 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
 
           {/* ── MASS BREAKDOWN ── */}
           <div style={{ marginBottom: "12px" }}>
-            <div style={{ fontSize: "11px", color: COLORS.trajectory, marginBottom: "4px", borderBottom: "1px solid rgba(74,111,165,0.3)", paddingBottom: "2px" }}>
+            <div style={{ fontSize: "11px", color: COLORS.trajectory, marginBottom: "4px", borderBottom: "1px solid rgba(255,255,255,0.12)", paddingBottom: "2px" }}>
               MASS BREAKDOWN
             </div>
             {/* Launch mass: total rocket + full propellant at T-0 */}
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", marginBottom: "2px" }}>
-              <span style={{ color: "#8899bb" }}>Launch Mass:</span>
+              <span style={{ color: "#9a9ca3" }}>Launch Mass:</span>
               <span style={{ fontWeight: "bold" }}>{fmtMass(stats.totalLaunchMass)}</span>
             </div>
             {/* Dry mass: rocket without propellant */}
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", marginBottom: "2px" }}>
-              <span style={{ color: "#8899bb" }}>Dry Mass:</span>
+              <span style={{ color: "#9a9ca3" }}>Dry Mass:</span>
               <span>{fmtMass(stats.totalDryMass)}</span>
             </div>
             {/* Propellant mass: just the fuel and oxidizer */}
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", marginBottom: "2px" }}>
-              <span style={{ color: "#8899bb" }}>Propellant:</span>
+              <span style={{ color: "#9a9ca3" }}>Propellant:</span>
               <span>{fmtMass(stats.totalFuelMass)}</span>
             </div>
             {/* Mass ratio: higher is better (more fuel per unit of structure) */}
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px" }}>
-              <span style={{ color: "#8899bb" }}>Mass Ratio:</span>
-              <span style={{ color: stats.totalLaunchMass > 0 && stats.totalDryMass > 0 ? "#88ddaa" : "#8899bb" }}>
+              <span style={{ color: "#9a9ca3" }}>Mass Ratio:</span>
+              <span style={{ color: stats.totalLaunchMass > 0 && stats.totalDryMass > 0 ? "#88ddaa" : "#9a9ca3" }}>
                 {stats.totalDryMass > 0 ? (stats.totalLaunchMass / stats.totalDryMass).toFixed(2) + ":1" : "—"}
               </span>
             </div>
@@ -1727,17 +1727,17 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
 
           {/* ── PERFORMANCE ── */}
           <div style={{ marginBottom: "12px" }}>
-            <div style={{ fontSize: "11px", color: COLORS.trajectory, marginBottom: "4px", borderBottom: "1px solid rgba(74,111,165,0.3)", paddingBottom: "2px" }}>
+            <div style={{ fontSize: "11px", color: COLORS.trajectory, marginBottom: "4px", borderBottom: "1px solid rgba(255,255,255,0.12)", paddingBottom: "2px" }}>
               PERFORMANCE
             </div>
             {/* Total thrust (first stage, sea level) */}
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", marginBottom: "2px" }}>
-              <span style={{ color: "#8899bb" }}>Stage 1 Thrust:</span>
+              <span style={{ color: "#9a9ca3" }}>Stage 1 Thrust:</span>
               <span>{fmtThrust(stats.firstStageTotalThrust)}</span>
             </div>
             {/* TWR: highlighted red if < 1, yellow if < 1.3, green if ≥ 1.3 */}
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", marginBottom: "2px" }}>
-              <span style={{ color: "#8899bb" }}>TWR (launch):</span>
+              <span style={{ color: "#9a9ca3" }}>TWR (launch):</span>
               <span style={{
                 fontWeight: "bold",
                 color: stats.twr < 1.0 ? "#ff4444"   // Red: cannot lift off
@@ -1749,7 +1749,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
             </div>
             {/* Total Δv from Tsiolkovsky rocket equation (multi-stage) */}
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", marginBottom: "2px" }}>
-              <span style={{ color: "#8899bb" }}>Total Δv:</span>
+              <span style={{ color: "#9a9ca3" }}>Total Δv:</span>
               <span style={{ color: stats.totalDeltaV > 7800 ? "#44ee88" : COLORS.text }}>
                 {stats.totalDeltaV > 0 ? fmtNum(Math.round(stats.totalDeltaV)) + " m/s" : "—"}
                 {/* Show LEO/GTO labels for context: LEO needs ~9.4 km/s with gravity losses */}
@@ -1758,7 +1758,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
             </div>
             {/* Estimated altitude: rough upper bound (Δv²/2g) */}
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px" }}>
-              <span style={{ color: "#8899bb" }}>Est. Altitude:</span>
+              <span style={{ color: "#9a9ca3" }}>Est. Altitude:</span>
               <span>
                 {stats.estimatedAltitudeKm > 0
                   ? fmtNum(Math.round(stats.estimatedAltitudeKm)) + " km*"
@@ -1775,7 +1775,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
 
           {/* ── STAGE BREAKDOWN ── */}
           <div style={{ marginBottom: "12px" }}>
-            <div style={{ fontSize: "11px", color: COLORS.trajectory, marginBottom: "4px", borderBottom: "1px solid rgba(74,111,165,0.3)", paddingBottom: "2px" }}>
+            <div style={{ fontSize: "11px", color: COLORS.trajectory, marginBottom: "4px", borderBottom: "1px solid rgba(255,255,255,0.12)", paddingBottom: "2px" }}>
               STAGE BREAKDOWN
             </div>
             {stages.map((stage, i) => {
@@ -1783,7 +1783,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
               const stageFuel = stage.fuelTanks.reduce((s, t) => s + t.capacityKg, 0); // Stage fuel
               const stageIsp = computeEffectiveIsp(stage.engines); // Effective Isp
               return (
-                <div key={i} style={{ marginBottom: "6px", paddingLeft: "8px", borderLeft: "2px solid rgba(74,111,165,0.3)" }}>
+                <div key={i} style={{ marginBottom: "6px", paddingLeft: "8px", borderLeft: "2px solid rgba(255,255,255,0.12)" }}>
                   <div style={{ fontSize: "11px", fontWeight: "bold", color: "#aabbcc", marginBottom: "2px" }}>
                     Stage {i + 1}: {stage.engines.length} engine{stage.engines.length !== 1 ? "s" : ""}, {stage.fuelTanks.length} tank{stage.fuelTanks.length !== 1 ? "s" : ""}
                   </div>
@@ -1799,7 +1799,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
 
           {/* ── WARNINGS / VALIDATION ── */}
           <div style={{ marginBottom: "12px" }}>
-            <div style={{ fontSize: "11px", color: COLORS.trajectory, marginBottom: "4px", borderBottom: "1px solid rgba(74,111,165,0.3)", paddingBottom: "2px" }}>
+            <div style={{ fontSize: "11px", color: COLORS.trajectory, marginBottom: "4px", borderBottom: "1px solid rgba(255,255,255,0.12)", paddingBottom: "2px" }}>
               VALIDATION
             </div>
             {warnings.length === 0 && (
@@ -1820,7 +1820,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
 
           {/* ── COST ESTIMATE ── */}
           <div style={{ marginBottom: "12px" }}>
-            <div style={{ fontSize: "11px", color: COLORS.trajectory, marginBottom: "4px", borderBottom: "1px solid rgba(74,111,165,0.3)", paddingBottom: "2px" }}>
+            <div style={{ fontSize: "11px", color: COLORS.trajectory, marginBottom: "4px", borderBottom: "1px solid rgba(255,255,255,0.12)", paddingBottom: "2px" }}>
               EST. COST
             </div>
             <div style={{ fontSize: "12px" }}>
@@ -1868,9 +1868,9 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
               style={{
                 width: "100%",
                 padding: "5px",
-                backgroundColor: "rgba(15,25,55,0.8)",
+                backgroundColor: "rgba(23,24,28,0.8)",
                 color: COLORS.text,
-                border: `1px solid rgba(74,111,165,0.4)`,
+                border: `1px solid rgba(255,255,255,0.16)`,
                 borderRadius: "3px",
                 cursor: "pointer",
                 fontSize: "12px",
@@ -1882,7 +1882,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
             </button>
 
             {showSavePanel && (
-              <div style={{ padding: "8px", backgroundColor: "rgba(5,8,20,0.8)", border: "1px solid rgba(74,111,165,0.3)", borderRadius: "3px" }}>
+              <div style={{ padding: "8px", backgroundColor: "rgba(15,16,18,0.85)", border: "1px solid rgba(255,255,255,0.12)", borderRadius: "3px" }}>
                 {/* Save name input field: user types the rocket's name here */}
                 <div style={{ display: "flex", gap: "4px", marginBottom: "8px" }}>
                   <input
@@ -1893,9 +1893,9 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
                     style={{
                       flex: 1,
                       padding: "4px 6px",
-                      backgroundColor: "#0d1a35",
+                      backgroundColor: "#14161b",
                       color: COLORS.text,
-                      border: "1px solid rgba(74,111,165,0.5)",
+                      border: "1px solid rgba(255,255,255,0.16)",
                       borderRadius: "3px",
                       fontSize: "11px",
                       fontFamily: "monospace",
@@ -1911,9 +1911,9 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
                     disabled={!saveNameInput.trim()} // Disable when no name is entered
                     style={{
                       padding: "4px 8px",
-                      backgroundColor: saveNameInput.trim() ? "rgba(15,60,20,0.8)" : "rgba(10,15,25,0.8)",
-                      color: saveNameInput.trim() ? "#88dd88" : "#445566",
-                      border: "1px solid rgba(74,111,165,0.3)",
+                      backgroundColor: saveNameInput.trim() ? "rgba(15,60,20,0.8)" : "rgba(16,17,20,0.85)",
+                      color: saveNameInput.trim() ? "#88dd88" : "#6b6e76",
+                      border: "1px solid rgba(255,255,255,0.12)",
                       borderRadius: "3px",
                       cursor: saveNameInput.trim() ? "pointer" : "default",
                       fontSize: "11px",
@@ -1925,13 +1925,13 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
                 </div>
 
                 {/* Hint text explaining that saved rockets appear in the simulator dropdown */}
-                <div style={{ fontSize: "9px", color: "#445566", marginBottom: "6px" }}>
+                <div style={{ fontSize: "9px", color: "#6b6e76", marginBottom: "6px" }}>
                   Saved rockets appear in the simulator's rocket selector as "★ Name (custom)"
                 </div>
 
                 {/* Saved builds list: LOAD and DELETE buttons for each saved rocket */}
                 {savedBuilds.length === 0 && (
-                  <div style={{ fontSize: "10px", color: "#445566" }}>No saved rockets yet.</div>
+                  <div style={{ fontSize: "10px", color: "#6b6e76" }}>No saved rockets yet.</div>
                 )}
                 {savedBuilds.map((name) => (
                   <div key={name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "3px" }}>
@@ -1944,9 +1944,9 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
                       onClick={() => loadBuild(name)} // Reconstruct stages from saved part IDs
                       style={{
                         padding: "2px 6px",
-                        backgroundColor: "rgba(15,25,55,0.9)",
+                        backgroundColor: "rgba(23,24,28,0.9)",
                         color: "#88aacc",
-                        border: "1px solid rgba(74,111,165,0.4)",
+                        border: "1px solid rgba(255,255,255,0.16)",
                         borderRadius: "3px",
                         cursor: "pointer",
                         fontSize: "10px",
@@ -1970,7 +1970,7 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
           flexShrink: 0,
           padding: "12px",
           borderTop: `1px solid ${COLORS.ui}`,
-          backgroundColor: "rgba(5,8,20,0.95)",
+          backgroundColor: "rgba(15,16,18,0.95)",
         }}>
           <button
             onClick={handleLaunch}  // Convert build to config and notify parent
@@ -1979,8 +1979,8 @@ export const RocketBuilder: React.FC<RocketBuilderProps> = ({ onLaunch, onSwitch
               width: "100%",
               padding: "10px",
               backgroundColor: canLaunch ? "rgba(20,80,20,0.9)" : "rgba(20,20,20,0.5)", // Green when ready, grey when not
-              color: canLaunch ? "#88ff88" : "#445566",
-              border: `2px solid ${canLaunch ? "#44aa44" : "rgba(74,111,165,0.2)"}`,
+              color: canLaunch ? "#88ff88" : "#6b6e76",
+              border: `2px solid ${canLaunch ? "#44aa44" : "rgba(255,255,255,0.09)"}`,
               borderRadius: "5px",
               cursor: canLaunch ? "pointer" : "not-allowed",
               fontSize: "16px",

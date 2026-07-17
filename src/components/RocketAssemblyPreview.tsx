@@ -1476,7 +1476,7 @@ export const RocketAssemblyPreview: React.FC<RocketAssemblyPreviewProps> = ({
       ctx.globalAlpha = 0.13;
       // Very faint (13% opacity) so it reads as a placeholder, not real content.
 
-      ctx.strokeStyle = "#4a6fa5";
+      ctx.strokeStyle = "#38bdf8";
       // Use the UI accent color (matching the border/header theme) for the placeholder.
 
       ctx.lineWidth = 1.5;
@@ -1511,7 +1511,7 @@ export const RocketAssemblyPreview: React.FC<RocketAssemblyPreviewProps> = ({
       ctx.fillText("to start building your rocket", cx, midY + plH * 0.4 + 16);
 
       // Left-pointing arrow toward catalog panel:
-      ctx.fillStyle = "rgba(74,111,165,0.4)";
+      ctx.fillStyle = "rgba(255,255,255,0.16)";
       ctx.font = "16px monospace";
       ctx.fillText("◀", PAD_LEFT + 10, midY);
 
@@ -1729,7 +1729,7 @@ export const RocketAssemblyPreview: React.FC<RocketAssemblyPreviewProps> = ({
       // Dashed divider line between stages (only between adjacent stages, not below stage 0):
       if (stageIndex < stages.length - 1) {
         ctx.setLineDash([3, 4]); // Short dashes, slightly longer gaps
-        ctx.strokeStyle = "rgba(74,111,165,0.35)"; // Faint accent-blue dashes
+        ctx.strokeStyle = "rgba(255,255,255,0.14)"; // Faint accent-blue dashes
         ctx.lineWidth = 0.7;
         ctx.beginPath();
         ctx.moveTo(PAD_LEFT, topY);
@@ -2171,7 +2171,7 @@ export const RocketAssemblyPreview: React.FC<RocketAssemblyPreviewProps> = ({
             // Clamp left so the menu doesn't extend off the right edge of the canvas.
             top: Math.max(4, Math.min(actionMenuY, canvasSize.h - 100)),
             // Clamp top so the menu stays within the canvas vertically.
-            backgroundColor: "rgba(5, 10, 30, 0.96)",
+            backgroundColor: "rgba(18, 19, 23, 0.96)",
             border: "1px solid #00FFFF",
             borderRadius: "5px",
             padding: "6px",
@@ -2250,7 +2250,7 @@ export const RocketAssemblyPreview: React.FC<RocketAssemblyPreviewProps> = ({
               padding: "4px 8px",
               backgroundColor: "rgba(15,20,40,0.8)",
               color: "#667799",
-              border: "1px solid rgba(74,111,165,0.3)",
+              border: "1px solid rgba(255,255,255,0.12)",
               borderRadius: "3px",
               cursor: "pointer",
               fontSize: "11px",

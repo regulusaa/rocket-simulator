@@ -155,7 +155,7 @@ export const DynamicsPanel: React.FC = () => {
                 <text
                   x={BAR_WIDTH + 3}
                   y={y + 3}
-                  fill="#556688"
+                  fill="#8a8d94"
                   fontSize={7}
                   fontFamily="var(--font-mono)"
                 >
@@ -226,7 +226,7 @@ export const DynamicsPanel: React.FC = () => {
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
           {/* Circular tilt indicator */}
           <svg width={32} height={32} viewBox="-16 -16 32 32" aria-label="Tilt indicator">
-            <circle cx={0} cy={0} r={14} fill="none" stroke="rgba(50,90,160,0.3)" strokeWidth={1} />
+            <circle cx={0} cy={0} r={14} fill="none" stroke="rgba(255,255,255,0.12)" strokeWidth={1} />
             {/* Center cross */}
             <line x1={0} y1={-3} x2={0} y2={3} stroke="rgba(136,153,187,0.4)" strokeWidth={0.5} />
             <line x1={-3} y1={0} x2={3} y2={0} stroke="rgba(136,153,187,0.4)" strokeWidth={0.5} />

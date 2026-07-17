@@ -85,8 +85,13 @@ function drawHistogram(
   const ctx = canvas.getContext('2d');
   if (!ctx || values.length === 0) return; // Guard: need context and data
 
-  const cw = canvas.width;   // Canvas pixel width
-  const ch = canvas.height;  // Canvas pixel height
+  // HiDPI: the buffer is sized to CSS pixels × devicePixelRatio (see the draw effect),
+  // so we map the context to logical CSS pixels once and then draw in CSS units.
+  // Without this the buffer defaults to 300×150 and gets stretched — blurry, oversized bars.
+  const dpr = canvas.width / (canvas.clientWidth || canvas.width);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const cw = canvas.clientWidth || canvas.width;   // Logical (CSS) width
+  const ch = canvas.clientHeight || canvas.height; // Logical (CSS) height
 
   // Margins for labels and padding
   const marginLeft   = 36; // Left margin for Y-axis value labels
@@ -125,7 +130,7 @@ function drawHistogram(
   const maxCount = Math.max(...binCounts); // Highest bin count (for Y-axis scaling)
 
   // ── CLEAR AND BACKGROUND ────────────────────────────────────────────
-  ctx.fillStyle = 'rgba(4, 8, 22, 1)'; // Dark background matching the panel
+  ctx.fillStyle = 'rgba(15, 16, 18, 1)'; // Dark background matching the panel
   ctx.fillRect(0, 0, cw, ch);
 
   // ── DRAW BARS ──────────────────────────────────────────────────────
@@ -149,7 +154,7 @@ function drawHistogram(
   }
 
   // ── AXES ────────────────────────────────────────────────────────────
-  ctx.strokeStyle = 'rgba(100, 130, 180, 0.5)'; // Faint blue axis lines
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)'; // Faint blue axis lines
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(marginLeft, marginTop);                    // Y-axis top
@@ -200,8 +205,11 @@ function drawPieChart(canvas: HTMLCanvasElement, runs: SimulationRun[]): void {
   const ctx = canvas.getContext('2d');
   if (!ctx || runs.length === 0) return; // Guard: need context and data
 
-  const cw = canvas.width;
-  const ch = canvas.height;
+  // HiDPI: map the context to logical CSS pixels (buffer = CSS px × devicePixelRatio).
+  const dpr = canvas.width / (canvas.clientWidth || canvas.width);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const cw = canvas.clientWidth || canvas.width;   // Logical (CSS) width
+  const ch = canvas.clientHeight || canvas.height; // Logical (CSS) height
 
   // Center and radius of the pie chart
   const cx = cw / 2;       // Horizontal center
@@ -227,7 +235,7 @@ function drawPieChart(canvas: HTMLCanvasElement, runs: SimulationRun[]): void {
   ].filter(seg => seg.count > 0); // Only draw segments with at least one run
 
   // ── CLEAR BACKGROUND ────────────────────────────────────────────────
-  ctx.fillStyle = 'rgba(4, 8, 22, 1)';
+  ctx.fillStyle = 'rgba(15, 16, 18, 1)';
   ctx.fillRect(0, 0, cw, ch);
 
   // ── DRAW PIE SLICES ──────────────────────────────────────────────────
@@ -247,7 +255,7 @@ function drawPieChart(canvas: HTMLCanvasElement, runs: SimulationRun[]): void {
     ctx.fill();
 
     // Thin separator lines between slices for clarity
-    ctx.strokeStyle = 'rgba(4, 8, 22, 0.7)'; // Background color separator
+    ctx.strokeStyle = 'rgba(15, 16, 18, 0.75)'; // Background color separator
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
@@ -314,12 +322,31 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
   const velHistRef       = useRef<HTMLCanvasElement>(null); // Landing velocity histogram
   const pieChartRef      = useRef<HTMLCanvasElement>(null); // Outcome pie chart
 
-  // ── DRAW CHARTS ON MOUNT AND WHEN RESULTS CHANGE ────────────────────────
-  useEffect(() => {
-    // Draw altitude distribution histogram
-    if (altHistRef.current) {
+  // ── DRAW CHARTS (HiDPI-aware) ────────────────────────────────────────────
+  // Size each canvas's drawing BUFFER to its real displayed size × devicePixelRatio,
+  // THEN draw. Previously the buffer was never set, so it defaulted to 300×150 and got
+  // CSS-stretched to fill the container — that's why the charts looked blurry and oversized.
+  const drawAllCharts = useCallback(() => {
+    const dpr = window.devicePixelRatio || 1;
+
+    // Match a canvas's pixel buffer to its CSS box (× dpr) so 1 CSS px = dpr device px.
+    const fitCanvas = (canvas: HTMLCanvasElement | null): boolean => {
+      if (!canvas) return false;
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      if (w === 0 || h === 0) return false; // Not laid out yet — skip (ResizeObserver will retry)
+      const bw = Math.round(w * dpr);
+      const bh = Math.round(h * dpr);
+      if (canvas.width !== bw || canvas.height !== bh) {
+        canvas.width = bw;   // Drawing buffer width in device pixels (crisp on retina)
+        canvas.height = bh;  // Drawing buffer height in device pixels
+      }
+      return true;
+    };
+
+    if (fitCanvas(altHistRef.current)) {
       drawHistogram(
-        altHistRef.current,
+        altHistRef.current!,
         results.runs.map(r => r.maxAltitude),   // Array of all peak altitudes (meters)
         10,                                       // 10 bins: enough granularity at 50 runs
         'Max Altitude Distribution',              // Chart title
@@ -328,23 +355,33 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
       );
     }
 
-    // Draw landing velocity distribution histogram
-    if (velHistRef.current) {
+    if (fitCanvas(velHistRef.current)) {
       drawHistogram(
-        velHistRef.current,
+        velHistRef.current!,
         results.runs.map(r => r.landingVelocity), // Array of landing impact speeds (m/s)
         10,                                         // 10 bins
         'Landing Velocity Distribution',            // Chart title
         'm/s',                                      // Unit label
-        'rgba(50, 150, 255, 0.75)'                  // Blue bars (neutral color, not success/fail)
+        'rgba(56, 189, 248, 0.8)'                   // Ice-cyan bars (neutral color, not success/fail)
       );
     }
 
-    // Draw outcome pie chart
-    if (pieChartRef.current) {
-      drawPieChart(pieChartRef.current, results.runs);
+    if (fitCanvas(pieChartRef.current)) {
+      drawPieChart(pieChartRef.current!, results.runs);
     }
-  }, [results]); // Re-draw whenever results data changes
+  }, [results]);
+
+  // Draw on mount / when results change, and redraw crisply whenever the layout resizes.
+  useEffect(() => {
+    drawAllCharts();
+
+    // Redraw when any chart container changes size (window resize, panel reflow).
+    const observer = new ResizeObserver(() => drawAllCharts());
+    for (const c of [altHistRef.current, velHistRef.current, pieChartRef.current]) {
+      if (c) observer.observe(c);
+    }
+    return () => observer.disconnect();
+  }, [drawAllCharts]); // Re-draw whenever results data changes (via drawAllCharts identity)
 
   // ── SHORTHAND STATS ─────────────────────────────────────────────────────
   // Extract frequently-used statistics to local variables for cleaner JSX
@@ -394,7 +431,7 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
       style={{
         position:        'fixed',             // Fixed positioning: covers the full viewport
         inset:           0,                   // top/right/bottom/left = 0: full coverage
-        backgroundColor: 'rgba(3, 5, 18, 0.97)', // Very dark, near-opaque space background
+        backgroundColor: 'rgba(10, 11, 13, 0.97)', // Very dark, near-opaque space background
         zIndex:          50,                  // On top of everything including landing modal
         display:         'flex',
         flexDirection:   'column',
@@ -411,7 +448,7 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
           alignItems:      'center',
           justifyContent:  'space-between',
           padding:         '8px 16px',
-          backgroundColor: 'rgba(5, 10, 30, 0.9)',
+          backgroundColor: 'rgba(16, 17, 20, 0.92)',
           borderBottom:    `1px solid ${COLORS.ui}`,
           flexShrink:      0, // Header doesn't shrink when content below grows
         }}
@@ -435,7 +472,7 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
           onClick={onClose} // Notify parent to hide this panel
           style={{
             padding:         '5px 14px',
-            backgroundColor: 'rgba(30, 20, 50, 0.9)',
+            backgroundColor: 'rgba(30, 30, 34, 0.9)',
             color:           '#ff8888',
             border:          '1px solid rgba(255, 100, 100, 0.4)',
             borderRadius:    3,
@@ -455,8 +492,8 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
           display:         'flex',
           gap:             2,
           padding:         '6px 8px',
-          backgroundColor: 'rgba(4, 8, 22, 0.8)',
-          borderBottom:    '1px solid rgba(74, 111, 165, 0.3)',
+          backgroundColor: 'rgba(15, 16, 18, 0.85)',
+          borderBottom:    '1px solid rgba(255, 255, 255, 0.12)',
           flexShrink:      0, // Summary bar stays fixed height
         }}
       >
@@ -505,8 +542,8 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
             style={{
               flex:            1,                          // Equal width cards
               padding:         '5px 8px',
-              backgroundColor: 'rgba(5, 12, 35, 0.7)',
-              border:          `1px solid rgba(74, 111, 165, 0.3)`,
+              backgroundColor: 'rgba(28, 30, 35, 0.7)',
+              border:          `1px solid rgba(255, 255, 255, 0.12)`,
               borderRadius:    3,
               minWidth:        0,                          // Allow flex shrinking
             }}
@@ -538,7 +575,7 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
           style={{
             flex:         '0 0 60%',              // Fixed at 60% of available width
             position:     'relative',
-            borderRight:  `1px solid rgba(74, 111, 165, 0.3)`,
+            borderRight:  `1px solid rgba(255, 255, 255, 0.12)`,
             display:      'flex',
             flexDirection:'column',
           }}
@@ -549,8 +586,8 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
               padding:         '4px 12px',
               fontSize:        11,
               opacity:         0.6,
-              backgroundColor: 'rgba(4, 8, 22, 0.5)',
-              borderBottom:    '1px solid rgba(74, 111, 165, 0.2)',
+              backgroundColor: 'rgba(15, 16, 18, 0.5)',
+              borderBottom:    '1px solid rgba(255, 255, 255, 0.09)',
               flexShrink:      0,
             }}
           >
@@ -592,30 +629,28 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
           }}
         >
           {/* ── ALTITUDE HISTOGRAM ──────────────────────────────────────── */}
-          <div style={{ flex: '0 0 28%', padding: 4, borderBottom: '1px solid rgba(74,111,165,0.2)' }}>
+          <div style={{ flex: '0 0 28%', padding: 4, borderBottom: '1px solid rgba(255,255,255,0.09)' }}>
             <canvas
               ref={altHistRef}
-              style={{ width: '100%', height: '100%', display: 'block' }}
-              // Note: actual pixel dimensions are set in the drawHistogram() call below
-              // via the useEffect — the CSS size stretches/shrinks the canvas element
-              // but the drawing resolution is set by canvas.width/canvas.height attributes.
-              // We don't set width/height here because drawHistogram reads them at draw time.
+              // Buffer resolution (canvas.width/height) is set in drawAllCharts() to the
+              // displayed size × devicePixelRatio, so the chart stays crisp on any display.
+              style={{ width: '100%', height: '100%', display: 'block', imageRendering: 'auto' }}
             />
           </div>
 
           {/* ── LANDING VELOCITY HISTOGRAM ─────────────────────────────── */}
-          <div style={{ flex: '0 0 28%', padding: 4, borderBottom: '1px solid rgba(74,111,165,0.2)' }}>
+          <div style={{ flex: '0 0 28%', padding: 4, borderBottom: '1px solid rgba(255,255,255,0.09)' }}>
             <canvas
               ref={velHistRef}
-              style={{ width: '100%', height: '100%', display: 'block' }}
+              style={{ width: '100%', height: '100%', display: 'block', imageRendering: 'auto' }}
             />
           </div>
 
           {/* ── PIE CHART ───────────────────────────────────────────────── */}
-          <div style={{ flex: '0 0 22%', padding: 4, borderBottom: '1px solid rgba(74,111,165,0.2)' }}>
+          <div style={{ flex: '0 0 22%', padding: 4, borderBottom: '1px solid rgba(255,255,255,0.09)' }}>
             <canvas
               ref={pieChartRef}
-              style={{ width: '100%', height: '100%', display: 'block' }}
+              style={{ width: '100%', height: '100%', display: 'block', imageRendering: 'auto' }}
             />
           </div>
 
@@ -645,7 +680,7 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
                     marginBottom:    1,
                     backgroundColor: run.id === selectedRunId
                       ? 'rgba(0, 150, 80, 0.25)' // Highlighted background for selected run
-                      : 'rgba(5, 12, 30, 0.4)',  // Normal dim background
+                      : 'rgba(255, 255, 255, 0.03)',  // Normal dim background
                     borderRadius:    2,
                     cursor:          'pointer',   // Indicate clickable row
                     border:          run.id === selectedRunId
@@ -683,7 +718,7 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
                     marginBottom:    1,
                     backgroundColor: run.id === selectedRunId
                       ? 'rgba(150, 30, 30, 0.25)' // Red highlight for selected failure run
-                      : 'rgba(5, 12, 30, 0.4)',
+                      : 'rgba(255, 255, 255, 0.03)',
                     borderRadius:    2,
                     cursor:          'pointer',
                     border:          run.id === selectedRunId
@@ -722,8 +757,8 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
             // Column widths: ID | MaxAlt | LandVel | Score | FlightTime | Outcome | Failure
             gridTemplateColumns: '40px 1fr 80px 60px 80px 100px 1fr',
             padding:         '4px 8px',
-            backgroundColor: 'rgba(5, 12, 35, 0.9)',
-            borderBottom:    '1px solid rgba(74,111,165,0.3)',
+            backgroundColor: 'rgba(20, 21, 25, 0.9)',
+            borderBottom:    '1px solid rgba(255,255,255,0.12)',
             fontSize:        10,
             fontWeight:      'bold',
             color:           'rgba(180, 200, 255, 0.7)',
@@ -753,11 +788,11 @@ export const MonteCarloPanel: React.FC<MonteCarloPanelProps> = ({
                 fontSize:        10,
                 cursor:          'pointer', // Clickable: selects this run in the trajectory plot
                 backgroundColor: run.id === selectedRunId
-                  ? 'rgba(50, 100, 200, 0.2)'  // Highlight color when selected
+                  ? 'rgba(56, 189, 248, 0.16)'  // Highlight color when selected
                   : run.outcome !== 'nominal'
                   ? 'rgba(80, 15, 15, 0.25)'   // Subtle red tint for failed runs
                   : 'transparent',              // Normal background for nominal runs
-                borderBottom:    '1px solid rgba(50, 70, 120, 0.2)',
+                borderBottom:    '1px solid rgba(255, 255, 255, 0.07)',
                 color:           run.id === selectedRunId ? '#ffffff' : 'rgba(200, 215, 255, 0.8)',
               }}
             >

@@ -79,7 +79,7 @@ export const AttitudeIndicator: React.FC = () => {
           cy={CY}
           r={RADIUS}
           fill="none"
-          stroke="rgba(50,90,160,0.4)"
+          stroke="rgba(255,255,255,0.16)"
           strokeWidth="1.5"
         />
 

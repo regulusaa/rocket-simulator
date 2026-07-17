@@ -88,7 +88,7 @@ const ThrottleGauge: React.FC<{ percent: number }> = ({ percent }) => {
       <path
         d={bgPath}
         fill="none"
-        stroke="rgba(50, 90, 160, 0.25)"
+        stroke="rgba(255, 255, 255, 0.1)"
         strokeWidth={7}
         strokeLinecap="round"
       />
@@ -163,7 +163,7 @@ const StageFuelRow: React.FC<{ stage: StageStatus }> = ({ stage }) => {
         <span
           className="panel__badge"
           style={{
-            background: 'rgba(80, 100, 140, 0.25)',
+            background: 'rgba(255, 255, 255, 0.08)',
             color: 'var(--text-tertiary)',
             fontSize: '7px',
           }}

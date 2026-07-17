@@ -154,15 +154,16 @@ export const ANGULAR_RESTORE_RATE = 1.5;
  * Centralized here so changing the visual theme only requires editing this object.
  */
 export const COLORS = {
-  background: "#0a0e27", // Deep space blue — night sky background
+  background: "#0f1012", // Neutral graphite — mission-control charcoal background
   ground: "#2d5016",     // Dark green — Earth's surface color
   rocket: "#e0e0e0",     // Light gray — rocket body default color
   rocketNose: "#ff4444", // Red nose cone — high-visibility warning color
   flame: "#ff8800",      // Orange flame core — engine exhaust
   velocity: "#00ff00",   // Green velocity vector — traditional "positive" color
-  trajectory: "#00ffff", // Cyan trajectory line — stands out against dark background
+  trajectory: "#38bdf8", // Ice-cyan accent line — stands out against graphite background
   text: "#ffffff",       // White text — maximum contrast on dark background
-  ui: "#4a6fa5",         // UI accent blue — consistent branding color for panels/borders
+  ui: "#38bdf8",         // UI accent (ice cyan) — active elements, highlights, links
+  border: "rgba(255,255,255,0.09)", // Neutral panel/modal border (replaces old navy borders)
 };
 
 // ─── GRID (optional visual reference) ─────────────────────────────────────────

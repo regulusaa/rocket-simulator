@@ -52,21 +52,21 @@
  *   The component-level inline styles also set fontFamily: "monospace" in many places;
  *   this body-level declaration is the fallback for elements that don't override it.
  *
- * background: #0a0e27 — Deep dark blue background color.
- *   Value breakdown: 0a (red=10/255), 0e (green=14/255), 27 (blue=39/255).
- *   This is very dark midnight blue — not pure black — which reduces eye strain
- *   on dark screens while still looking like deep space.
+ * background: #0f1012 — Neutral graphite background color.
+ *   Value breakdown: 0f (red=15/255), 10 (green=16/255), 12 (blue=18/255).
+ *   A near-neutral charcoal (no blue tint) matching the mission-control theme —
+ *   easy on the eyes on dark screens without the old navy cast.
  *   Canvas elements sit ON TOP of this background; the canvas fills the viewport
  *   so the body background is only visible for a split second on page load.
  *
  * color: #ffffff — Default text color is white.
  *   Nearly all text in the app is white or near-white for legibility on the
  *   dark background. Individual elements override this where needed (e.g., the
- *   trajectory panel uses cyan #00ffff for labels).
+ *   HUD accent uses ice cyan #38bdf8 for labels).
  */
 body {
   font-family: monospace;
-  background: #0a0e27;
+  background: #0f1012;
   color: #ffffff;
 }
 

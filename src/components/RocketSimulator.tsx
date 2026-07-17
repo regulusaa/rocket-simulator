@@ -1879,9 +1879,9 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
   // Style for buttons in the top bar.
   const btnStyle = (active: boolean, accent?: string): React.CSSProperties => ({
     padding:         "4px 10px",
-    backgroundColor: active ? (accent ?? COLORS.ui) : "rgba(15, 25, 50, 0.9)",
+    backgroundColor: active ? (accent ?? COLORS.ui) : "rgba(28, 30, 35, 0.9)",
     color:           active ? "#fff" : COLORS.text,
-    border:          `1px solid ${active ? (accent ?? COLORS.ui) : "rgba(74,111,165,0.5)"}`,
+    border:          `1px solid ${active ? (accent ?? COLORS.ui) : "rgba(255,255,255,0.16)"}`,
     borderRadius:    "3px",
     cursor:          "pointer",
     fontSize:        "12px",
@@ -1983,7 +1983,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             top:             "50%",
             left:            "50%",
             transform:       "translate(-50%, -50%)", // True center of viewport
-            backgroundColor: "rgba(5, 8, 25, 0.95)",
+            backgroundColor: "rgba(18, 19, 23, 0.96)",
             border:          `2px solid ${COLORS.ui}`,
             borderRadius:    "6px",
             padding:         "20px 28px",
@@ -2009,7 +2009,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
               fontSize: "42px",
               fontWeight: "bold",
               color: landingScore >= 80 ? "#44ff44" : landingScore >= 50 ? "#ffaa00" : "#ff4444",
-              borderLeft: "2px solid rgba(74,111,165,0.5)",
+              borderLeft: "2px solid rgba(255,255,255,0.16)",
               paddingLeft: "16px",
             }}>
               {getLetterGrade(landingScore)}
@@ -2090,7 +2090,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             top:             "50%",
             left:            "50%",
             transform:       "translate(-50%, -50%)", // Perfectly centered on viewport
-            backgroundColor: "rgba(4, 8, 22, 0.98)",
+            backgroundColor: "rgba(15, 16, 18, 0.98)",
             border:          `2px solid ${COLORS.ui}`,
             borderRadius:    "6px",
             padding:         "20px 24px",
@@ -2129,9 +2129,9 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
                     padding:         "5px 0",
                     backgroundColor: mcConfig.numberOfRuns === n
                       ? COLORS.ui           // Active/selected: accent blue
-                      : "rgba(10, 20, 50, 0.8)", // Inactive: dark background
+                      : "rgba(28, 30, 35, 0.85)", // Inactive: dark background
                     color:           mcConfig.numberOfRuns === n ? "#fff" : "#aabbcc",
-                    border:          `1px solid ${mcConfig.numberOfRuns === n ? COLORS.ui : "rgba(74,111,165,0.4)"}`,
+                    border:          `1px solid ${mcConfig.numberOfRuns === n ? COLORS.ui : "rgba(255,255,255,0.16)"}`,
                     borderRadius:    3,
                     cursor:          "pointer",
                     fontFamily:      "monospace",
@@ -2286,7 +2286,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             bottom:          60,
             left:            "50%",
             transform:       "translateX(-50%)", // Center horizontally
-            backgroundColor: "rgba(4, 8, 22, 0.95)",
+            backgroundColor: "rgba(15, 16, 18, 0.95)",
             border:          `1px solid ${COLORS.ui}`,
             borderRadius:    6,
             padding:         "10px 18px",
@@ -2307,7 +2307,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             style={{
               width:           "100%",
               height:          6,
-              backgroundColor: "rgba(30, 50, 100, 0.6)",
+              backgroundColor: "rgba(255, 255, 255, 0.1)",
               borderRadius:    3,
               overflow:        "hidden",
             }}
@@ -2371,8 +2371,8 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
             bottom:          "220px",
             right:           "12px",
             width:           "180px",
-            backgroundColor: "rgba(4, 8, 22, 0.75)",
-            border:          `1px solid rgba(74, 111, 165, 0.4)`,
+            backgroundColor: "rgba(15, 16, 18, 0.78)",
+            border:          `1px solid rgba(255, 255, 255, 0.16)`,
             borderRadius:    "4px",
             padding:         "6px 8px",
             fontFamily:      "monospace",
@@ -2423,7 +2423,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           <div
             onClick={(e) => e.stopPropagation()} // Prevent click-through to backdrop
             style={{
-              backgroundColor: "rgba(5, 10, 30, 0.97)",
+              backgroundColor: "rgba(18, 19, 23, 0.97)",
               border:          `2px solid ${COLORS.ui}`,
               borderRadius:    "6px",
               padding:         "20px 28px",
@@ -2458,7 +2458,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
                     <td style={{ padding: "3px 0", width: "90px" }}>
                       <span style={{
                         display:         "inline-block",
-                        backgroundColor: "rgba(74, 111, 165, 0.25)",
+                        backgroundColor: "rgba(255, 255, 255, 0.09)",
                         border:          `1px solid ${COLORS.ui}`,
                         borderRadius:    "3px",
                         padding:         "1px 6px",
@@ -2502,7 +2502,7 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
           <div
             onClick={e => e.stopPropagation()} // Don't close when clicking inside the modal
             style={{
-              backgroundColor: "rgba(5, 10, 28, 0.97)",
+              backgroundColor: "rgba(18, 19, 23, 0.97)",
               border:          `1px solid ${COLORS.ui}`,
               borderRadius:    "6px",
               padding:         "20px 24px",
@@ -2537,10 +2537,10 @@ export const RocketSimulator: React.FC<RocketSimulatorProps> = ({
                       alignItems:      "center",
                       padding:         "8px 10px",
                       backgroundColor: selectedRocketKey === `custom:${r.id}`
-                        ? "rgba(74,111,165,0.20)" // Highlight currently-active rocket
+                        ? "rgba(255,255,255,0.09)" // Highlight currently-active rocket
                         : "rgba(255,255,255,0.03)",
                       borderRadius:    "4px",
-                      border:          `1px solid rgba(74,111,165,0.2)`,
+                      border:          `1px solid rgba(255,255,255,0.09)`,
                     }}
                   >
                     {/* Rocket info: name + save date */}
